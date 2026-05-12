@@ -16,7 +16,7 @@ ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _detect_zplanes(folder: str) -> list[str]:
     """Scan a session folder and return the z-plane names it contains."""
@@ -41,6 +41,24 @@ def _frame_layout(fp: float, pre_s: float, bl_s: float, st_s: float) -> dict:
     return dict(pre_f=pre_f, base_f=base_f, stim_f=stim_f, ses_f=ses_f)
 
 
+def _read_provenance(project_dir: str) -> dict:
+    """Load provenance.yaml from a project folder. Returns empty dict if not found."""
+    import yaml
+    from collections import defaultdict
+    p = Path(project_dir) / "provenance.yaml"
+    if p.exists():
+        with open(p, "r") as f:
+            return defaultdict(lambda: None, yaml.safe_load(f) or {})
+    return defaultdict(lambda: None)
+
+
+def _stage_status(prov: dict) -> dict[str, bool]:
+    """Return which pipeline stages are already complete based on provenance."""
+    mc_done   = bool(prov.get("rigid_motion_correction"))
+    cnmf_done = bool(prov.get("source_extraction"))
+    return dict(mc=mc_done, cnmf=cnmf_done)
+
+
 # ── animal row widget ─────────────────────────────────────────────────────────
 
 class AnimalRow(ctk.CTkFrame):
@@ -60,7 +78,8 @@ class AnimalRow(ctk.CTkFrame):
             ("Session 2:", self.sess2_var, "Stimulus 2 folder  (e.g. glucose)"),
         ]):
             ctk.CTkLabel(self, text=label, width=74).grid(
-                row=row_idx, column=1, padx=(0, 4), pady=(4 if row_idx == 0 else 2, 4 if row_idx == 1 else 2), sticky="w")
+                row=row_idx, column=1, padx=(0, 4),
+                pady=(5 if row_idx == 0 else 2, 5 if row_idx == 1 else 2), sticky="w")
             ctk.CTkEntry(self, textvariable=var, width=270,
                          placeholder_text=ph).grid(
                 row=row_idx, column=2, padx=4,
@@ -81,6 +100,10 @@ class AnimalRow(ctk.CTkFrame):
     def get_paths(self) -> tuple[str, str]:
         return self.sess1_var.get().strip(), self.sess2_var.get().strip()
 
+    def set_paths(self, s1: str, s2: str):
+        self.sess1_var.set(s1)
+        self.sess2_var.set(s2)
+
 
 # ── main window ───────────────────────────────────────────────────────────────
 
@@ -88,8 +111,8 @@ class PipelineGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("2P Calcium Imaging Pipeline")
-        self.geometry("860x700")
-        self.minsize(720, 580)
+        self.geometry("860x720")
+        self.minsize(720, 600)
         self.animal_rows: list[AnimalRow] = []
         self._build_ui()
 
@@ -110,24 +133,40 @@ class PipelineGUI(ctk.CTk):
     def _build_animals_tab(self):
         tab = self.tabs.tab("Animals & Data")
 
+        # load project banner
+        banner = ctk.CTkFrame(tab)
+        banner.pack(fill="x", padx=14, pady=(14, 6))
+        ctk.CTkLabel(banner,
+                     text="Have a project folder from a previous run?",
+                     anchor="w").pack(side="left", padx=12, pady=8)
+        ctk.CTkButton(banner, text="Load existing project",
+                      width=170, command=self._load_project).pack(
+            side="right", padx=12, pady=8)
+
         top = ctk.CTkFrame(tab, fg_color="transparent")
-        top.pack(fill="x", padx=14, pady=(14, 6))
+        top.pack(fill="x", padx=14, pady=(4, 6))
 
         ctk.CTkLabel(top, text="Subject ID:", width=130, anchor="w").grid(
             row=0, column=0, pady=5, sticky="w")
         self.subject_var = ctk.StringVar()
+        self.subject_var.trace_add("write", lambda *_: self._check_provenance())
         ctk.CTkEntry(top, textvariable=self.subject_var, width=180,
                      placeholder_text="e.g. ZH511").grid(
             row=0, column=1, padx=8, sticky="w")
 
-        ctk.CTkLabel(top, text="Output folder:", width=130, anchor="w").grid(
+        ctk.CTkLabel(top, text="Output / project folder:", width=130, anchor="w").grid(
             row=1, column=0, pady=5, sticky="w")
         self.output_var = ctk.StringVar()
+        self.output_var.trace_add("write", lambda *_: self._check_provenance())
         ctk.CTkEntry(top, textvariable=self.output_var, width=320,
-                     placeholder_text="Where to save results").grid(
+                     placeholder_text="All stage outputs will be saved here").grid(
             row=1, column=1, padx=8, sticky="w")
         ctk.CTkButton(top, text="Browse", width=80,
                       command=self._browse_output).grid(row=1, column=2, padx=4)
+
+        # provenance status indicator
+        self.prov_label = ctk.CTkLabel(tab, text="", text_color="gray")
+        self.prov_label.pack(anchor="w", padx=18, pady=(0, 4))
 
         mode_row = ctk.CTkFrame(tab, fg_color="transparent")
         mode_row.pack(fill="x", padx=14, pady=4)
@@ -144,7 +183,7 @@ class PipelineGUI(ctk.CTk):
                      text="Each session folder should contain the raw per-frame TIFFs from the microscope.",
                      text_color="gray").pack(anchor="w", padx=16, pady=(8, 0))
 
-        self.animals_scroll = ctk.CTkScrollableFrame(tab, height=250)
+        self.animals_scroll = ctk.CTkScrollableFrame(tab, height=220)
         self.animals_scroll.pack(fill="both", expand=True, padx=12, pady=6)
 
         self.add_btn = ctk.CTkButton(tab, text="＋  Add Animal",
@@ -178,9 +217,94 @@ class PipelineGUI(ctk.CTk):
             r.index = i
 
     def _browse_output(self):
-        path = filedialog.askdirectory(title="Select output folder")
+        path = filedialog.askdirectory(title="Select output / project folder")
         if path:
             self.output_var.set(path)
+
+    # ── project loading & provenance detection ─────────────────────────────
+
+    def _load_project(self):
+        """Let the user pick an existing project folder and restore state from provenance."""
+        folder = filedialog.askdirectory(title="Select project folder  (e.g. ZH511/)")
+        if not folder:
+            return
+        folder = Path(folder)
+        prov = _read_provenance(str(folder))
+
+        # fill subject + output from provenance if available, otherwise from path
+        stored_outdir = prov.get("output_dir", "")
+        if stored_outdir:
+            self.output_var.set(str(Path(stored_outdir).parent))
+            self.subject_var.set(Path(stored_outdir).name)
+        else:
+            self.output_var.set(str(folder.parent))
+            self.subject_var.set(folder.name)
+
+        # restore session paths
+        load_args = prov.get("load_data") or {}
+        load_args = load_args.get("args") or {} if isinstance(load_args, dict) else {}
+        multi_path = load_args.get("multi_path", [])
+        ch_dict    = load_args.get("ch_dict", {})
+
+        if len(multi_path) >= 2:
+            self.animal_rows[0].set_paths(str(multi_path[0]), str(multi_path[1]))
+
+        if ch_dict:
+            self.mc_ch_var.set(ch_dict.get("mc_ch", "ch1"))
+            self.func_ch_var.set(ch_dict.get("func_ch", "ch2"))
+
+        # restore z-planes
+        mc_prov = prov.get("rigid_motion_correction") or {}
+        if isinstance(mc_prov, dict) and mc_prov:
+            self.z_planes_var.set(",".join(mc_prov.keys()))
+
+        self._check_provenance()
+        self.tabs.set("Run")
+
+    def _check_provenance(self):
+        """
+        Read provenance for the current output+subject and update the stage
+        checkboxes and status label to reflect what is already done.
+        """
+        if not hasattr(self, "do_mc"):
+            return  # Run tab not built yet
+
+        output  = self.output_var.get().strip()
+        subject = self.subject_var.get().strip()
+        if not output or not subject:
+            self.prov_label.configure(text="")
+            return
+
+        project_dir = str(Path(output) / subject)
+        prov   = _read_provenance(project_dir)
+        status = _stage_status(prov)
+
+        parts = []
+        if status["mc"]:
+            self.do_mc.deselect()
+            parts.append("motion correction ✓")
+        else:
+            self.do_mc.select()
+
+        if status["cnmf"]:
+            self.do_cnmf.deselect()
+            parts.append("CNMF ✓")
+        else:
+            self.do_cnmf.select()
+
+        # check for saved analysis results
+        results_dir = Path(project_dir) / "analysis"
+        if (results_dir / "resp1.npy").exists():
+            parts.append("analysis results ✓")
+
+        if parts:
+            self.prov_label.configure(
+                text=f"  Existing project found — {',  '.join(parts)}",
+                text_color="#5cb85c")
+        else:
+            self.prov_label.configure(
+                text="  No existing project found at this location — will start fresh.",
+                text_color="gray")
 
     # ── tab 2: recording ───────────────────────────────────────────────────
 
@@ -224,7 +348,6 @@ class PipelineGUI(ctk.CTk):
         self._refresh()
 
     def _autodetect_zplanes(self):
-        # Use the first session folder of the first animal to detect z-planes
         if not self.animal_rows:
             messagebox.showinfo("Auto-detect", "Add an animal and set Session 1 first.")
             return
@@ -356,7 +479,8 @@ class PipelineGUI(ctk.CTk):
         self.do_analysis.select()
 
         ctk.CTkLabel(tab,
-                     text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.",
+                     text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.\n"
+                          "Results are saved automatically to  <project folder>/analysis/",
                      text_color="gray", wraplength=740).pack(anchor="w", padx=22, pady=4)
 
         self.run_btn = ctk.CTkButton(tab, text="▶   Run",
@@ -381,7 +505,7 @@ class PipelineGUI(ctk.CTk):
 
         output = self.output_var.get().strip()
         if not output:
-            errs.append("Output folder is required.")
+            errs.append("Output / project folder is required.")
 
         animals = []
         for r in self.animal_rows:
@@ -458,8 +582,10 @@ class PipelineGUI(ctk.CTk):
             self._log(traceback.format_exc())
         finally:
             sys.stdout = old_stdout
-            self.after(0, lambda: self.run_btn.configure(
-                state="normal", text="▶   Run"))
+            self.after(0, lambda: (
+                self.run_btn.configure(state="normal", text="▶   Run"),
+                self._check_provenance(),
+            ))
 
     def _pipeline_body(self, p: dict):
         from pipeline import (init, load_data, affine_motion_correction,
@@ -472,7 +598,7 @@ class PipelineGUI(ctk.CTk):
         threshold = p["threshold"]
 
         d = _frame_layout(fp, pre_s, base_s, stim_s)
-        stim_onset_idx = d["base_f"]  # index inside stims1/stims2 where stimulus starts
+        stim_onset_idx = d["base_f"]
 
         self._log(
             f"Frame layout: {d['pre_f']} discard  +  {d['base_f']} baseline  "
@@ -548,15 +674,60 @@ class PipelineGUI(ctk.CTk):
             f"Stim-1 only: {nums[0]}   Both: {nums[1]}   Stim-2 only: {nums[2]}   "
             f"Total responsive: {n_total} / {all_stims1.shape[0]}"
         )
+
+        # save results
+        out_dir = str(Path(p["output"]) / p["subject"])
+        results_dir = self._save_results(
+            out_dir, resp1, resp2, nums, z_ids_sel, p,
+            stim_onset_idx, d["ses_f"])
+        self._log(f"Results saved to  {results_dir}")
+
         self._log("Opening figures …")
         self.after(0, lambda: self._show_plots(
-            resp1, resp2, nums, stim_onset_idx, d["ses_f"], fp, pre_s))
+            resp1, resp2, nums, stim_onset_idx, d["ses_f"],
+            fp, pre_s, results_dir))
         self._log("Done.")
+
+    # ── save results ───────────────────────────────────────────────────────
+
+    def _save_results(self, out_dir: str, resp1, resp2, nums, z_ids_sel,
+                      params: dict, stim_onset_idx: int, ses_f: int) -> str:
+        import yaml
+
+        results_dir = Path(out_dir) / "analysis"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        np.save(results_dir / "resp1.npy",    resp1)
+        np.save(results_dir / "resp2.npy",    resp2)
+        np.save(results_dir / "nums.npy",     np.array(nums))
+        np.save(results_dir / "z_ids_stim1.npy", z_ids_sel[0])
+        np.save(results_dir / "z_ids_both.npy",  z_ids_sel[1])
+        np.save(results_dir / "z_ids_stim2.npy", z_ids_sel[2])
+
+        saved_params = dict(
+            frame_period   = params["frame_period"],
+            pre_discard_s  = params["pre_discard_s"],
+            baseline_s     = params["baseline_s"],
+            stim_s         = params["stim_s"],
+            threshold      = params["threshold"],
+            stim_onset_idx = stim_onset_idx,
+            ses_f          = ses_f,
+            z_planes       = params["z_planes"],
+            n_stim1_only   = int(nums[0]),
+            n_both         = int(nums[1]),
+            n_stim2_only   = int(nums[2]),
+            n_total_neurons= int(sum(nums)),
+        )
+        with open(results_dir / "params.yaml", "w") as f:
+            yaml.safe_dump(saved_params, f, default_flow_style=False)
+
+        return str(results_dir)
 
     # ── plots ──────────────────────────────────────────────────────────────
 
     def _show_plots(self, resp1, resp2, nums,
-                    stim_onset_idx: int, ses_f: int, fp: float, pre_s: float):
+                    stim_onset_idx: int, ses_f: int,
+                    fp: float, pre_s: float, results_dir: str):
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
 
@@ -579,7 +750,6 @@ class PipelineGUI(ctk.CTk):
         im = ax1.imshow(resp1, aspect="auto", vmin=0, vmax=8)
         ax2.imshow(resp2, aspect="auto", vmin=0, vmax=8)
 
-        # x-tick positions & labels in seconds
         pre_f = round(pre_s / fp)
         tick_frames = [0, stim_onset_idx, resp1.shape[1]]
         tick_labels = [
@@ -595,6 +765,7 @@ class PipelineGUI(ctk.CTk):
             ax.set_xticks(tick_frames, tick_labels)
         fig.colorbar(im, ax=[ax1, ax2], shrink=0.5, label="z-score")
         fig.suptitle("Responder heatmap")
+        fig.savefig(Path(results_dir) / "heatmap.png", dpi=150, bbox_inches="tight")
 
         # bar chart
         fig2, ax = plt.subplots(figsize=(4, 4))
@@ -604,7 +775,7 @@ class PipelineGUI(ctk.CTk):
         ax.set_ylabel("% responsive neurons")
         ax.spines[["top", "right"]].set_visible(False)
         fig2.tight_layout()
-        fig2.suptitle("Responder breakdown", y=1.02)
+        fig2.savefig(Path(results_dir) / "breakdown.png", dpi=150, bbox_inches="tight")
 
         plt.show()
 
