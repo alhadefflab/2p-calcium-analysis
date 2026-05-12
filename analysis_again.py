@@ -188,7 +188,7 @@ if  __name__ == "__main__":
         all_resp1 = []
         all_resp2 = []
         for i, f in enumerate(folders):
-            _resp1, _resp2, _nums = get_resp1_resp2(_all_stims1[i], _all_stims2[i])
+            _resp1, _resp2, _nums, _ = get_resp1_resp2(_all_stims1[i], _all_stims2[i], _z_ids[i])
             all_resp1.append(resp1)
             all_resp2.append(resp2)
             all_nums.append(_nums)
@@ -215,7 +215,7 @@ if  __name__ == "__main__":
 
 
         # Mean z score
-        start, end = 103, 719 #103, 411
+        start, end = 51, 719  # 103-52: adjusted for bline1_start offset
         # meanfrucResp2fruc = frucResp2fruc[:, start:end].mean(axis=1)
         # meanglucResp2gluc = glucResp2gluc[:, start:end].mean(axis=1)
 

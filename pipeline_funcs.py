@@ -350,7 +350,7 @@ def get_stims1_stims2(provenance):
     return stims1, stims2, np.r_[z_ids]
 
 def get_resp1_resp2(stims1, stims2, z_ids):
-    stim1_start, stim1_end = 103, 719  #103, 411
+    stim1_start, stim1_end = 51, 719  # 103-52: adjusted for bline1_start offset (stims1[:,0] == original frame 52)
 
     start, end = stim1_start, stim1_end
     responder_stim1 = (np.median(stims1[:, start:end], axis=1) > 1.64) 

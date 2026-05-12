@@ -570,6 +570,9 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
 
     cnm = cnm.fit(f_ch_rigcorr)
 
+    cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
+    cnm.estimates.select_components(use_object=True)
+
     # save
     cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
     cnm.save(cnmf_file.as_posix()) 
@@ -587,7 +590,7 @@ def _save_source_extraction_video(cnm, z, output_dir):
     _min, _max = mv.min(), mv.max()
     mv = np.array(255 * (mv - _min) / (_max - _min), dtype = 'uint8')
     
-    src_extraction_file = output_dir / f'conat_{z}_src-extraction-video.mp4'
+    src_extraction_file = output_dir / f'concat_{z}_src-extraction-video.mp4'
     imageio.mimwrite(src_extraction_file.as_posix(), mv, fps = 30,  quality=7) 
 
 
