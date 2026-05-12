@@ -301,12 +301,12 @@ def why(provenance, cnm, center):
     out.release
 
 
-def get_stims1_stims2(provenance):
+def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
     stims1 = []
     stims2 = []
     z_ids = []
 
-    zs = provenance['source_extraction'].keys()    
+    zs = provenance['source_extraction'].keys()
 
     for i, z in enumerate(zs):
         cnm_file = provenance['source_extraction'][z]['filenames']['cnm_file']
@@ -317,16 +317,21 @@ def get_stims1_stims2(provenance):
         img = imgs.max(axis=0)
 
         cnm = cnmf.load_CNMF(cnm_file)
-        center = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1]) 
+        center = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
 
 
         #why(provenance, cnm, center)
 
         #
-        bline1_start, bline1_end = 52, 103 #0, 103
-        stim1_start, stim1_end = 103, 719 #103, 411 #103, 308 
-        bline2_start, bline2_end =771, 822 #463, 514 #411, 514 
-        stim2_start, stim2_end = 822, 1438 #514, 822 #412,616  
+        pre_f  = round(pre_discard_s / frame_period)
+        base_f = round(baseline_s    / frame_period)
+        stim_f = round(stim_s        / frame_period)
+        ses_f  = pre_f + base_f + stim_f
+
+        bline1_start, bline1_end = pre_f,            pre_f + base_f
+        stim1_start,  stim1_end  = bline1_end,       ses_f
+        bline2_start, bline2_end = ses_f + pre_f,    ses_f + pre_f + base_f
+        stim2_start,  stim2_end  = bline2_end,       2 * ses_f
 
         fl_acc1 = custom_df_f_startend(cnm, bline1_start, bline1_end, method='zscore', use_residuals=True)
         fl_acc2 = custom_df_f_startend(cnm, bline2_start, bline2_end, method='zscore', use_residuals=True)
@@ -349,12 +354,11 @@ def get_stims1_stims2(provenance):
 
     return stims1, stims2, np.r_[z_ids]
 
-def get_resp1_resp2(stims1, stims2, z_ids):
-    stim1_start, stim1_end = 51, 719  # 103-52: adjusted for bline1_start offset (stims1[:,0] == original frame 52)
+def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
+    start, end = stim_onset_idx, stims1.shape[1]
 
-    start, end = stim1_start, stim1_end
-    responder_stim1 = (np.median(stims1[:, start:end], axis=1) > 1.64) 
-    responder_stim2 = (np.median(stims2[:, start:end], axis=1) > 1.64)
+    responder_stim1 = (np.median(stims1[:, start:end], axis=1) > threshold)
+    responder_stim2 = (np.median(stims2[:, start:end], axis=1) > threshold)
 
     r_stim1only = responder_stim1 & ~responder_stim2
     r_stim2only = ~responder_stim1 & responder_stim2
