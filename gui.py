@@ -166,19 +166,22 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._refresh_image()
 
     def _do_add(self):
-        import caiman as cm
-        from pipeline_utils import draw_masks
-        Yr, dims, T = cm.load_memmap(self._mc_corr_file)
-        mc_data = np.reshape(Yr.T, [T] + list(dims), order='F')
-        ms, mask = draw_masks(
-            self._roi_img_bkg, self._roi_img_mask.copy(),
-            np.zeros(mc_data.shape[-2:], np.uint8),
-            show_plot=False, title=self._z)
-        if messagebox.askyesno("Confirm addition", "Add this neuron?", parent=self):
-            self._roi_masks = np.concatenate(
-                [self._roi_masks, mask.reshape((-1, 1), order='F')], axis=1)
-            self._roi_img_mask = ms
-            self._refresh_image()
+        try:
+            import caiman as cm
+            from pipeline_utils import draw_masks
+            Yr, dims, T = cm.load_memmap(self._mc_corr_file)
+            mc_data = np.reshape(Yr.T, [T] + list(dims), order='F')
+            ms, mask = draw_masks(
+                self._roi_img_bkg, self._roi_img_mask.copy(),
+                np.zeros(mc_data.shape[-2:], np.uint8),
+                show_plot=False, title=self._z)
+            if messagebox.askyesno("Confirm addition", "Add this neuron?", parent=self):
+                self._roi_masks = np.concatenate(
+                    [self._roi_masks, mask.reshape((-1, 1), order='F')], axis=1)
+                self._roi_img_mask = ms
+                self._refresh_image()
+        except Exception as exc:
+            messagebox.showerror("Add Neuron failed", str(exc), parent=self)
 
     def _do_finish(self):
         clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
@@ -645,6 +648,10 @@ class PipelineGUI(ctk.CTk):
 
     def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
         """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
+        # Resolve relative mmap path — provenance may store it relative to the project root
+        if not Path(mc_corr_file).is_absolute():
+            mc_corr_file = str(Path(output_dir) / Path(mc_corr_file).name)
+
         result_holder = [None]
         done = threading.Event()
 
