@@ -635,9 +635,23 @@ class PipelineGUI(ctk.CTk):
                 for z in p["z_planes"]:
                     self._log(
                         f"  Source extraction ({z}) — "
-                        "watch for the ROI editor window in the background …")
-                    provenance = source_extraction(
-                        provenance, None, z, None)
+                        "the ROI editor will open; close it to continue …")
+                    result_holder = [None]
+                    done = threading.Event()
+
+                    def _run_src_extraction(prov=provenance, _z=z):
+                        try:
+                            result_holder[0] = source_extraction(prov, None, _z, None)
+                        except Exception as exc:
+                            result_holder[0] = exc
+                        finally:
+                            done.set()
+
+                    self.after(0, _run_src_extraction)
+                    done.wait()
+                    if isinstance(result_holder[0], Exception):
+                        raise result_holder[0]
+                    provenance = result_holder[0]
             else:
                 self._log("  Skipping CNMF — using saved results.")
 
