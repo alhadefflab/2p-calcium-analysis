@@ -604,7 +604,7 @@ def _visualize_src_extraction_results(self, idx=[41]):
 
 
 @capture_args
-def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, **kwargs):
+def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, **kwargs):
 
     import glob 
 
@@ -675,9 +675,15 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     mc_corr_file = rigcorr_results_filenames[ch_dict['mc_ch']] 
     func_corr_file = rigcorr_results_filenames[ch_dict['func_ch']] 
 
-    roi_masks, _, roi_img_bkg, roi_img_mask, func_lc = _identify_rois(output_dir, func_corr_file, z, **idroi_params)
+    _idroi = {**idroi_params, 'show_figs': False} if roi_editor_fn is not None else idroi_params
+    roi_masks, _, roi_img_bkg, roi_img_mask, func_lc = _identify_rois(output_dir, func_corr_file, z, **_idroi)
 
-    roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask  = _addremove_rois_manually(output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
+    if roi_editor_fn is not None:
+        roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask = roi_editor_fn(
+            output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
+    else:
+        roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask = _addremove_rois_manually(
+            output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
 
     cnm, cnm_file =  _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
 

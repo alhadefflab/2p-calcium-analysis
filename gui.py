@@ -105,6 +105,87 @@ class AnimalRow(ctk.CTkFrame):
         self.sess2_var.set(s2)
 
 
+# ── ROI editor popup ──────────────────────────────────────────────────────────
+
+class ROIEditorWindow(ctk.CTkToplevel):
+    """Popup shown during source extraction for manual ROI review."""
+
+    def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish):
+        super().__init__(parent)
+        self.title(f"ROI Editor — {z}")
+        self.resizable(True, True)
+        self.grab_set()
+
+        self._z            = z
+        self._roi_masks    = roi_masks.copy()
+        self._roi_img_bkg  = roi_img_bkg.copy()
+        self._roi_img_mask = roi_img_mask.copy()
+        self._mc_corr_file = mc_corr_file
+        self._on_finish    = on_finish
+
+        self._img_label = ctk.CTkLabel(self, text="")
+        self._img_label.pack(padx=10, pady=10)
+        self._refresh_image()
+
+        btn_frame = ctk.CTkFrame(self)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(btn_frame, text="Remove Neurons",
+                      command=self._do_remove).pack(side="left", padx=8, pady=6)
+        ctk.CTkButton(btn_frame, text="Add Neuron",
+                      command=self._do_add).pack(side="left", padx=8, pady=6)
+        ctk.CTkButton(btn_frame, text="Finish",
+                      fg_color="#2d6a2d", hover_color="#1e4d1e",
+                      command=self._do_finish).pack(side="right", padx=8, pady=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._do_finish)
+
+    def _refresh_image(self):
+        from PIL import Image as PILImage
+        combined = np.clip(
+            self._roi_img_bkg.astype(int) + self._roi_img_mask.astype(int), 0, 255
+        ).astype(np.uint8)
+        pil_img = PILImage.fromarray(combined)
+        h, w = combined.shape[:2]
+        size = 600
+        scale = size / max(h, w)
+        nw, nh = int(w * scale), int(h * scale)
+        pil_img = pil_img.resize((nw, nh), PILImage.LANCZOS)
+        self._ctk_img = ctk.CTkImage(pil_img, size=(nw, nh))
+        self._img_label.configure(image=self._ctk_img, text="")
+
+    def _do_remove(self):
+        from pipeline_utils import remove_neurons
+        neurons, ms = remove_neurons(
+            self._roi_masks, self._roi_img_bkg, self._roi_img_mask.copy(), title=self._z)
+        if neurons and messagebox.askyesno(
+                "Confirm removal",
+                f"Remove {len(neurons)} selected neuron(s)?",
+                parent=self):
+            self._roi_masks = np.delete(self._roi_masks, neurons, 1)
+            self._roi_img_mask = ms
+            self._refresh_image()
+
+    def _do_add(self):
+        import caiman as cm
+        from pipeline_utils import draw_masks
+        Yr, dims, T = cm.load_memmap(self._mc_corr_file)
+        mc_data = np.reshape(Yr.T, [T] + list(dims), order='F')
+        ms, mask = draw_masks(
+            self._roi_img_bkg, self._roi_img_mask.copy(),
+            np.zeros(mc_data.shape[-2:], np.uint8),
+            show_plot=False, title=self._z)
+        if messagebox.askyesno("Confirm addition", "Add this neuron?", parent=self):
+            self._roi_masks = np.concatenate(
+                [self._roi_masks, mask.reshape((-1, 1), order='F')], axis=1)
+            self._roi_img_mask = ms
+            self._refresh_image()
+
+    def _do_finish(self):
+        clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
+        self._on_finish(clean, self._roi_img_bkg, self._roi_img_mask)
+        self.destroy()
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 
 class PipelineGUI(ctk.CTk):
@@ -562,6 +643,25 @@ class PipelineGUI(ctk.CTk):
         self.run_btn.configure(state="disabled", text="Running…")
         threading.Thread(target=self._run_pipeline, args=(p,), daemon=True).start()
 
+    def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
+        """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
+        result_holder = [None]
+        done = threading.Event()
+
+        def _show():
+            def _on_finish(masks, bkg, mask_img):
+                result_holder[0] = (masks, bkg, mask_img)
+                done.set()
+            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, _on_finish)
+
+        self.after(0, _show)
+        done.wait()
+
+        new_masks, new_bkg, new_mask_img = result_holder[0]
+        roi_masks_file = Path(output_dir) / 'concat_roi-masks.npy'
+        np.save(roi_masks_file, new_masks)
+        return new_masks, roi_masks_file, new_bkg, new_mask_img
+
     def _run_pipeline(self, p: dict):
         class _StdoutCapture:
             def __init__(self, fn):
@@ -632,26 +732,13 @@ class PipelineGUI(ctk.CTk):
                 provenance = _get_provenance(out_dir)
 
             if self.do_cnmf.get():
+                roi_fn = self._roi_editor_for_pipeline
                 for z in p["z_planes"]:
                     self._log(
                         f"  Source extraction ({z}) — "
-                        "the ROI editor will open; close it to continue …")
-                    result_holder = [None]
-                    done = threading.Event()
-
-                    def _run_src_extraction(prov=provenance, _z=z):
-                        try:
-                            result_holder[0] = source_extraction(prov, None, _z, None)
-                        except Exception as exc:
-                            result_holder[0] = exc
-                        finally:
-                            done.set()
-
-                    self.after(0, _run_src_extraction)
-                    done.wait()
-                    if isinstance(result_holder[0], Exception):
-                        raise result_holder[0]
-                    provenance = result_holder[0]
+                        "ROI editor will open in a popup window …")
+                    provenance = source_extraction(
+                        provenance, None, z, None, roi_editor_fn=roi_fn)
             else:
                 self._log("  Skipping CNMF — using saved results.")
 
