@@ -114,7 +114,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.title(f"ROI Editor — {z}")
         self.resizable(True, True)
-        self.grab_set()
+        self.lift()
+        self.focus_force()
 
         self._z            = z
         self._roi_masks    = roi_masks.copy()
@@ -589,7 +590,7 @@ class PipelineGUI(ctk.CTk):
 
         output = self.output_var.get().strip()
         if not output:
-            errs.append("Output / project folder is required.")
+            errs.append("Output / proj\ect folder is required.")
 
         animals = []
         for r in self.animal_rows:
