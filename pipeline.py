@@ -623,7 +623,7 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     #mc.dview = dview
 
     prov = provenance['load_data']['args']
-    ch_dict, z = prov['ch_dict'], prov['z']
+    ch_dict = prov['ch_dict']
     output_dir = Path(provenance['output_dir']) / z
     output_dir.mkdir(exist_ok=True)
 
