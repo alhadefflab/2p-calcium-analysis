@@ -8,6 +8,7 @@ import threading
 import traceback
 from pathlib import Path
 
+import tkinter as tk
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import numpy as np
@@ -105,88 +106,301 @@ class AnimalRow(ctk.CTkFrame):
         self.sess2_var.set(s2)
 
 
-# ── ROI editor popup ──────────────────────────────────────────────────────────
+# ── ROI curation window ───────────────────────────────────────────────────────
 
 class ROIEditorWindow(ctk.CTkToplevel):
-    """Popup shown during source extraction for manual ROI review."""
+    """Integrated ROI curation: remove, add, and region-exclusion in one window."""
+
+    _REMOVE = "remove"
+    _ADD    = "add"
+    _REGION = "region"
+
+    _INSTRUCTIONS = {
+        "remove": (
+            "RIGHT-CLICK on a colored patch to remove that neuron.\n\n"
+            "The patch disappears immediately.\n\n"
+            "Use Undo to restore the last change."
+        ),
+        "add": (
+            "LEFT-CLICK and DRAG to paint a new neuron.\n\n"
+            "Fill the entire soma — do not just trace the outline.\n\n"
+            "Release the mouse to confirm."
+        ),
+        "region": (
+            "LEFT-CLICK to place polygon vertices around the region to KEEP "
+            "(e.g. draw around the DVC).\n\n"
+            "RIGHT-CLICK to close the polygon.\n\n"
+            "Neurons whose centres fall outside are removed."
+        ),
+    }
 
     def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish):
         super().__init__(parent)
-        self.title(f"ROI Editor — {z}")
-        self.resizable(True, True)
+        self.title(f"ROI Curation — {z}")
+        self.resizable(False, False)
         self.lift()
         self.focus_force()
 
-        self._z            = z
-        self._roi_masks    = roi_masks.copy()
-        self._roi_img_bkg  = roi_img_bkg.copy()
-        self._roi_img_mask = roi_img_mask.copy()
-        self._mc_corr_file = mc_corr_file
-        self._on_finish    = on_finish
+        self._on_finish = on_finish
+        self._roi_masks = roi_masks.copy()
+        self._roi_bkg   = roi_img_bkg.copy()
+        self._roi_msk   = roi_img_mask.copy()
 
-        self._img_label = ctk.CTkLabel(self, text="")
-        self._img_label.pack(padx=10, pady=10)
-        self._refresh_image()
+        h, w = roi_img_bkg.shape[:2]
+        self._ih, self._iw = h, w
+        cs = min(560, max(320, max(h, w)))
+        self._scale = cs / max(h, w)
+        self._dh, self._dw = int(h * self._scale), int(w * self._scale)
 
-        btn_frame = ctk.CTkFrame(self)
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(btn_frame, text="Remove Neurons",
-                      command=self._do_remove).pack(side="left", padx=8, pady=6)
-        ctk.CTkButton(btn_frame, text="Add Neuron",
-                      command=self._do_add).pack(side="left", padx=8, pady=6)
-        ctk.CTkButton(btn_frame, text="Finish",
-                      fg_color="#2d6a2d", hover_color="#1e4d1e",
-                      command=self._do_finish).pack(side="right", padx=8, pady=6)
+        self._mode      = None
+        self._new_mask  = None
+        self._add_col   = None
+        self._poly_pts  = []
+        self._poly_ids  = []
+        self._history   = []
+        self._img_id    = None
+
+        self._build_ui()
+        self._set_mode(self._REMOVE)
+        self._refresh_canvas()
+
+    # ── build ─────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = ctk.CTkFrame(self)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._canvas = tk.Canvas(outer, width=self._dw, height=self._dh,
+                                  bg="black", highlightthickness=0)
+        self._canvas.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        self._canvas.bind("<Button-3>",        self._on_right)
+        self._canvas.bind("<Button-1>",        self._on_left_dn)
+        self._canvas.bind("<B1-Motion>",       self._on_left_mv)
+        self._canvas.bind("<ButtonRelease-1>", self._on_left_up)
+
+        panel = ctk.CTkFrame(outer, width=220)
+        panel.grid(row=0, column=1, sticky="nsew")
+        panel.grid_propagate(False)
+
+        ctk.CTkLabel(panel, text="Mode",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(12, 6), padx=10)
+
+        self._mode_btns = {}
+        for key, lbl in [(self._REMOVE, "Remove Neurons"),
+                          (self._ADD,    "Add Neuron"),
+                          (self._REGION, "Exclude Region")]:
+            b = ctk.CTkButton(panel, text=lbl, width=190,
+                               command=lambda k=key: self._set_mode(k))
+            b.pack(pady=3, padx=10)
+            self._mode_btns[key] = b
+
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+
+        self._instr = ctk.CTkLabel(panel, text="", wraplength=200,
+                                    justify="left", anchor="nw")
+        self._instr.pack(padx=10, fill="x")
+
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+
+        self._status = ctk.CTkLabel(panel, text="", wraplength=200,
+                                     text_color="#aaaaaa", anchor="w")
+        self._status.pack(padx=10, fill="x")
+
+        ctk.CTkButton(panel, text="Finish ✓", width=190,
+                       fg_color="#2d6a2d", hover_color="#1e4d1e",
+                       command=self._do_finish).pack(side="bottom", padx=10, pady=4)
+        ctk.CTkButton(panel, text="Undo", width=190,
+                       command=self._undo).pack(side="bottom", padx=10, pady=4)
 
         self.protocol("WM_DELETE_WINDOW", self._do_finish)
 
-    def _refresh_image(self):
-        from PIL import Image as PILImage
+    # ── mode ──────────────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode):
+        self._mode    = mode
+        self._new_mask = None
+        self._add_col  = None
+        for pid in self._poly_ids:
+            self._canvas.delete(pid)
+        self._poly_pts = []
+        self._poly_ids = []
+
+        for k, btn in self._mode_btns.items():
+            btn.configure(fg_color="#1a5276" if k == mode else ("#3b8ed0", "#1f6aa5"))
+        self._instr.configure(text=self._INSTRUCTIONS.get(mode, ""))
+        self._status.configure(text="")
+
+    # ── canvas ────────────────────────────────────────────────────────────────
+
+    def _refresh_canvas(self):
+        from PIL import Image as PILImage, ImageTk
         combined = np.clip(
-            self._roi_img_bkg.astype(int) + self._roi_img_mask.astype(int), 0, 255
+            self._roi_bkg.astype(np.int16) + self._roi_msk.astype(np.int16), 0, 255
         ).astype(np.uint8)
-        pil_img = PILImage.fromarray(combined)
-        h, w = combined.shape[:2]
-        size = 600
-        scale = size / max(h, w)
-        nw, nh = int(w * scale), int(h * scale)
-        pil_img = pil_img.resize((nw, nh), PILImage.LANCZOS)
-        self._ctk_img = ctk.CTkImage(pil_img, size=(nw, nh))
-        self._img_label.configure(image=self._ctk_img, text="")
+        pil = PILImage.fromarray(combined).resize((self._dw, self._dh), PILImage.NEAREST)
+        self._tk_img = ImageTk.PhotoImage(pil)
+        if self._img_id is None:
+            self._img_id = self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+        else:
+            self._canvas.itemconfig(self._img_id, image=self._tk_img)
+        self._canvas.tag_lower(self._img_id)
 
-    def _do_remove(self):
-        from pipeline_utils import remove_neurons
-        neurons, ms = remove_neurons(
-            self._roi_masks, self._roi_img_bkg, self._roi_img_mask.copy(), title=self._z)
-        if neurons and messagebox.askyesno(
-                "Confirm removal",
-                f"Remove {len(neurons)} selected neuron(s)?",
+    def _c2i(self, cx, cy):
+        return int(cx / self._scale), int(cy / self._scale)
+
+    def _flat(self, ix, iy):
+        return ix * self._ih + iy
+
+    # ── remove ────────────────────────────────────────────────────────────────
+
+    def _on_right(self, event):
+        if self._mode == self._REMOVE:
+            ix, iy = self._c2i(event.x, event.y)
+            if not (0 <= ix < self._iw and 0 <= iy < self._ih):
+                return
+            flat = self._flat(ix, iy)
+            if flat >= self._roi_masks.shape[0]:
+                return
+            row = self._roi_masks[flat]
+            if row.sum() != 1:
+                return
+            self._push_history()
+            nidx = int(np.argmax(row))
+            pxs = self._roi_masks[:, nidx].reshape((self._ih, self._iw), order='F')
+            self._roi_msk[pxs] = 0
+            self._roi_masks = np.delete(self._roi_masks, nidx, 1)
+            self._status.configure(text=f"Removed. Total: {self._roi_masks.shape[1]}")
+            self._refresh_canvas()
+        elif self._mode == self._REGION:
+            self._close_polygon()
+
+    # ── add ───────────────────────────────────────────────────────────────────
+
+    def _on_left_dn(self, event):
+        if self._mode == self._ADD:
+            self._new_mask = np.zeros((self._ih, self._iw), dtype=bool)
+            self._add_col  = tuple(np.random.randint(40, 210, 3).tolist())
+            self._paint(event.x, event.y)
+        elif self._mode == self._REGION:
+            self._add_poly_pt(event.x, event.y)
+
+    def _on_left_mv(self, event):
+        if self._mode == self._ADD and self._new_mask is not None:
+            self._paint(event.x, event.y)
+
+    def _paint(self, cx, cy):
+        ix, iy = self._c2i(cx, cy)
+        br = 5
+        for dx in range(-br, br + 1):
+            for dy in range(-br, br + 1):
+                px, py = ix + dx, iy + dy
+                if 0 <= px < self._iw and 0 <= py < self._ih:
+                    self._new_mask[py, px] = True
+        r = max(2, int(br * self._scale))
+        col = "#{:02x}{:02x}{:02x}".format(*self._add_col)
+        self._canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                  fill=col, outline=col, tags="paint")
+
+    def _on_left_up(self, event):
+        if self._mode != self._ADD or self._new_mask is None:
+            return
+        if not self._new_mask.any():
+            self._new_mask = None
+            return
+        confirmed = messagebox.askyesno(
+            "Add neuron", "Add this painted region as a new neuron?", parent=self)
+        self._canvas.delete("paint")
+        if confirmed:
+            self._push_history()
+            flat_col = self._new_mask.flatten('F').reshape(-1, 1)
+            self._roi_masks = np.concatenate([self._roi_masks, flat_col], axis=1)
+            self._roi_msk[self._new_mask] = np.array(self._add_col, dtype=np.uint8)
+            self._status.configure(text=f"Added. Total: {self._roi_masks.shape[1]}")
+        self._new_mask = None
+        self._add_col  = None
+        self._refresh_canvas()
+
+    # ── region exclusion ──────────────────────────────────────────────────────
+
+    def _add_poly_pt(self, cx, cy):
+        dot = self._canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                        fill="yellow", outline="yellow", tags="poly")
+        self._poly_ids.append(dot)
+        if self._poly_pts:
+            px, py = self._poly_pts[-1]
+            ln = self._canvas.create_line(px, py, cx, cy,
+                                           fill="yellow", width=2, tags="poly")
+            self._poly_ids.append(ln)
+        self._poly_pts.append((cx, cy))
+        self._status.configure(
+            text=f"{len(self._poly_pts)} point(s). Right-click to close.")
+
+    def _close_polygon(self):
+        if len(self._poly_pts) < 3:
+            self._status.configure(text="Need at least 3 points first.")
+            return
+        px, py = self._poly_pts[-1]
+        fx, fy = self._poly_pts[0]
+        self._poly_ids.append(
+            self._canvas.create_line(px, py, fx, fy,
+                                      fill="yellow", width=2, tags="poly"))
+
+        from PIL import Image as PILImage, ImageDraw
+        poly_img = [(int(cx / self._scale), int(cy / self._scale))
+                    for cx, cy in self._poly_pts]
+        pmask = PILImage.new('L', (self._iw, self._ih), 0)
+        ImageDraw.Draw(pmask).polygon(poly_img, fill=255)
+        inside = np.array(pmask, dtype=bool)
+
+        n = self._roi_masks.shape[1]
+        keep = np.ones(n, dtype=bool)
+        for i in range(n):
+            pxs = self._roi_masks[:, i].reshape((self._ih, self._iw), order='F')
+            ys, xs = np.where(pxs)
+            if len(xs) == 0:
+                keep[i] = False
+                continue
+            keep[i] = inside[int(ys.mean()), int(xs.mean())]
+
+        removed = int((~keep).sum())
+        if removed > 0 and messagebox.askyesno(
+                "Exclude region",
+                f"Remove {removed} neuron(s) outside the polygon?",
                 parent=self):
-            self._roi_masks = np.delete(self._roi_masks, neurons, 1)
-            self._roi_img_mask = ms
-            self._refresh_image()
+            self._push_history()
+            for i in np.where(~keep)[0]:
+                pxs = self._roi_masks[:, i].reshape((self._ih, self._iw), order='F')
+                self._roi_msk[pxs] = 0
+            self._roi_masks = self._roi_masks[:, keep]
+            self._status.configure(
+                text=f"Excluded {removed}. Total: {self._roi_masks.shape[1]}")
+            self._refresh_canvas()
+        elif removed == 0:
+            self._status.configure(text="All neurons are inside the polygon.")
 
-    def _do_add(self):
-        try:
-            import caiman as cm
-            from pipeline_utils import draw_masks
-            Yr, dims, T = cm.load_memmap(self._mc_corr_file)
-            mc_data = np.reshape(Yr.T, [T] + list(dims), order='F')
-            ms, mask = draw_masks(
-                self._roi_img_bkg, self._roi_img_mask.copy(),
-                np.zeros(mc_data.shape[-2:], np.uint8),
-                show_plot=False, title=self._z)
-            if messagebox.askyesno("Confirm addition", "Add this neuron?", parent=self):
-                self._roi_masks = np.concatenate(
-                    [self._roi_masks, mask.reshape((-1, 1), order='F')], axis=1)
-                self._roi_img_mask = ms
-                self._refresh_image()
-        except Exception as exc:
-            messagebox.showerror("Add Neuron failed", str(exc), parent=self)
+        for pid in self._poly_ids:
+            self._canvas.delete(pid)
+        self._poly_ids = []
+        self._poly_pts = []
+
+    # ── undo / finish ─────────────────────────────────────────────────────────
+
+    def _push_history(self):
+        self._history.append((self._roi_masks.copy(), self._roi_msk.copy()))
+        if len(self._history) > 20:
+            self._history.pop(0)
+
+    def _undo(self):
+        if not self._history:
+            self._status.configure(text="Nothing to undo.")
+            return
+        self._roi_masks, self._roi_msk = self._history.pop()
+        self._status.configure(text=f"Undone. Total: {self._roi_masks.shape[1]}")
+        self._refresh_canvas()
 
     def _do_finish(self):
         clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
-        self._on_finish(clean, self._roi_img_bkg, self._roi_img_mask)
+        self._on_finish(clean, self._roi_bkg, self._roi_msk)
         self.destroy()
 
 
