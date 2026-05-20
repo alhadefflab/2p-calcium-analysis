@@ -134,7 +134,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         ),
     }
 
-    def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish):
+    def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish,
+                 display_settings=None):
         super().__init__(parent)
         self.title(f"ROI Curation — {z}")
         self.resizable(True, True)
@@ -161,6 +162,11 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._history   = []
         self._img_id    = None
         self._ref_id    = None
+
+        ds = display_settings or {}
+        self._gamma_var  = tk.DoubleVar(value=ds.get("gamma",   1.36))
+        self._lo_var     = tk.DoubleVar(value=ds.get("lo_pct",  26.7))
+        self._hi_var     = tk.DoubleVar(value=ds.get("hi_pct",  98.8))
 
         self._build_ui()
         self._set_mode(self._REMOVE)
@@ -226,6 +232,31 @@ class ROIEditorWindow(ctk.CTkToplevel):
                                      text_color="#aaaaaa", anchor="w")
         self._status.pack(padx=10, fill="x")
 
+        # ── display settings sliders ──────────────────────────────────────────
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(panel, text="Display Settings",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(0, 4))
+
+        def _make_slider(label, var, from_, to, steps):
+            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=2)
+            val_lbl = ctk.CTkLabel(row, width=38, anchor="e",
+                                   text=f"{var.get():.2f}")
+            def _on_change(v, lbl=val_lbl, variable=var):
+                variable.set(float(v))
+                lbl.configure(text=f"{float(v):.2f}")
+                self._refresh_canvas()
+            ctk.CTkLabel(row, text=label, width=82, anchor="w").pack(side="left")
+            ctk.CTkSlider(row, from_=from_, to=to, number_of_steps=steps,
+                          variable=var, command=_on_change,
+                          width=80).pack(side="left", padx=4)
+            val_lbl.pack(side="left")
+
+        _make_slider("Gamma",      self._gamma_var, 0.2, 1.5, 130)
+        _make_slider("Dark clip%", self._lo_var,    0.0, 30.0, 300)
+        _make_slider("Bright clip%", self._hi_var,  70.0, 100.0, 300)
+        # ─────────────────────────────────────────────────────────────────────
+
         ctk.CTkButton(panel, text="Finish ✓", width=190,
                        fg_color="#2d6a2d", hover_color="#1e4d1e",
                        command=self._do_finish).pack(side="bottom", padx=10, pady=4)
@@ -267,15 +298,16 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._refresh_canvas()
 
     def _bright_bkg(self) -> np.ndarray:
-        """Contrast-stretch + gentle gamma lift for display."""
-        bkg = self._roi_bkg.astype(np.float32)
-        lo  = np.percentile(bkg, 25)
-        hi  = np.percentile(bkg, 95)
+        """Contrast-stretch + gamma lift using slider-controlled parameters."""
+        bkg   = self._roi_bkg.astype(np.float32)
+        lo    = np.percentile(bkg, self._lo_var.get())
+        hi    = np.percentile(bkg, self._hi_var.get())
+        gamma = self._gamma_var.get()
         if hi > lo:
             bkg = np.clip((bkg - lo) / (hi - lo), 0, 1)
         else:
             bkg = np.zeros_like(bkg)
-        bkg = np.power(bkg, 0.8) * 255  # gamma 0.7 — moderate midtone lift
+        bkg = np.power(bkg, gamma) * 255
         return np.clip(bkg, 0, 255).astype(np.uint8)
 
     def _refresh_canvas(self):
@@ -458,7 +490,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
     def _do_finish(self):
         clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
-        self._on_finish(clean, self._roi_bkg, self._roi_msk)
+        settings = {
+            "gamma":  round(self._gamma_var.get(), 3),
+            "lo_pct": round(self._lo_var.get(),    3),
+            "hi_pct": round(self._hi_var.get(),    3),
+        }
+        self._on_finish(clean, self._roi_bkg, self._roi_msk, settings)
         self.destroy()
 
 
@@ -917,23 +954,40 @@ class PipelineGUI(ctk.CTk):
 
     def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
         """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
+        import yaml
         # Resolve relative mmap path — provenance may store it relative to the project root
         if not Path(mc_corr_file).is_absolute():
             mc_corr_file = str(Path(output_dir) / Path(mc_corr_file).name)
+
+        # Load persisted display settings (carry over from previous z-plane)
+        ds_path = Path(output_dir) / 'display_settings.yaml'
+        if not hasattr(self, '_display_settings'):
+            if ds_path.exists():
+                with open(ds_path, 'r') as f:
+                    self._display_settings = yaml.safe_load(f) or {}
+            else:
+                self._display_settings = {}
 
         result_holder = [None]
         done = threading.Event()
 
         def _show():
-            def _on_finish(masks, bkg, mask_img):
-                result_holder[0] = (masks, bkg, mask_img)
+            def _on_finish(masks, bkg, mask_img, settings):
+                result_holder[0] = (masks, bkg, mask_img, settings)
                 done.set()
-            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, _on_finish)
+            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
+                            _on_finish, display_settings=self._display_settings)
 
         self.after(0, _show)
         done.wait()
 
-        new_masks, new_bkg, new_mask_img = result_holder[0]
+        new_masks, new_bkg, new_mask_img, settings = result_holder[0]
+
+        # Persist settings for next z-plane and save to project folder
+        self._display_settings = settings
+        with open(ds_path, 'w') as f:
+            yaml.dump(settings, f)
+
         roi_masks_file = Path(output_dir) / 'concat_roi-masks.npy'
         np.save(roi_masks_file, new_masks)
         return new_masks, roi_masks_file, new_bkg, new_mask_img
