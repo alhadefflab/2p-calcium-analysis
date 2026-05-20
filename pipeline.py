@@ -49,17 +49,36 @@ def _save_provenance(provenance):
         yaml.safe_dump(unwrap(provenance), f, default_flow_style=False)
 
 
-def init(output_dir=None): 
+def _remap_provenance_paths(obj, old_root: str, new_root: str):
+    """Recursively replace old_root path prefix with new_root in all provenance strings."""
+    old_fwd = old_root.replace('\\', '/')
+    new_fwd = new_root.replace('\\', '/')
+    if isinstance(obj, str):
+        return obj.replace(old_root, new_root).replace(old_fwd, new_fwd)
+    if isinstance(obj, dict):
+        return {k: _remap_provenance_paths(v, old_root, new_root) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_remap_provenance_paths(v, old_root, new_root) for v in obj]
+    return obj
+
+
+def init(output_dir=None):
     if output_dir is None:
         output_dir = "run-" + datetime.now().strftime('%m-%d-%H%M%S')
-    
-    output_dir = Path(output_dir)    
+
+    output_dir = Path(output_dir).resolve()
     output_dir.mkdir(exist_ok=True)
 
     provenance = _get_provenance(output_dir)
-    if 'output_dir' not in provenance:
-        provenance['output_dir'] = output_dir
+    stored = provenance.get('output_dir')
+    new_root = str(output_dir)
 
+    if stored and str(stored) != new_root:
+        # Project was moved or copied from another machine — remap all stored paths.
+        provenance = defaultdict(lambda: None,
+                                 _remap_provenance_paths(dict(provenance), str(stored), new_root))
+
+    provenance['output_dir'] = new_root
     _save_provenance(provenance)
     return provenance
 
@@ -422,7 +441,6 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
     from cellpose import models
     import cv2 as cv
 
-
     func = cm.load(func_ch_file)
 
     if method == 'max':
@@ -471,8 +489,6 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
     np.save(roi_masks_file, roi_masks)  
 
     return roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask, func_lc
-    
-
 
 def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_img_bkg0, roi_img_mask0):
     """Press ESC to exit the GUI"""

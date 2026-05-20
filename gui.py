@@ -137,7 +137,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish):
         super().__init__(parent)
         self.title(f"ROI Curation — {z}")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.lift()
         self.focus_force()
 
@@ -148,9 +148,10 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
         h, w = roi_img_bkg.shape[:2]
         self._ih, self._iw = h, w
-        cs = min(560, max(320, max(h, w)))
-        self._scale = cs / max(h, w)
-        self._dh, self._dw = int(h * self._scale), int(w * self._scale)
+        # initial scale — will be updated when window maximises and Configure fires
+        self._scale = 500 / max(h, w)
+        self._dh = int(h * self._scale)
+        self._dw = int(w * self._scale)
 
         self._mode      = None
         self._new_mask  = None
@@ -159,20 +160,39 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._poly_ids  = []
         self._history   = []
         self._img_id    = None
+        self._ref_id    = None
 
         self._build_ui()
         self._set_mode(self._REMOVE)
-        self._refresh_canvas()
+        self.after(50, lambda: self.state('zoomed'))  # open maximised
 
     # ── build ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         outer = ctk.CTkFrame(self)
         outer.pack(fill="both", expand=True, padx=10, pady=10)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)  # canvas area expands
+        outer.columnconfigure(1, weight=0)  # panel stays fixed
 
-        self._canvas = tk.Canvas(outer, width=self._dw, height=self._dh,
-                                  bg="black", highlightthickness=0)
-        self._canvas.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        # ── canvas area (left two thirds) ─────────────────────────────────────
+        canvas_area = ctk.CTkFrame(outer)
+        canvas_area.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        canvas_area.rowconfigure(1, weight=1)
+        canvas_area.columnconfigure(0, weight=1)
+        canvas_area.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(canvas_area, text="Reference  (no ROIs)",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, pady=(4, 2))
+        ctk.CTkLabel(canvas_area, text="ROIs  (interactive)",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, pady=(4, 2))
+
+        self._canvas_ref = tk.Canvas(canvas_area, bg="black", highlightthickness=0)
+        self._canvas_ref.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+
+        self._canvas = tk.Canvas(canvas_area, bg="black", highlightthickness=0)
+        self._canvas.grid(row=1, column=1, sticky="nsew")
+        self._canvas.bind("<Configure>",       self._on_canvas_resize)
         self._canvas.bind("<Button-3>",        self._on_right)
         self._canvas.bind("<Button-1>",        self._on_left_dn)
         self._canvas.bind("<B1-Motion>",       self._on_left_mv)
@@ -232,13 +252,51 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
     # ── canvas ────────────────────────────────────────────────────────────────
 
+    def _on_canvas_resize(self, event):
+        if hasattr(self, '_resize_job'):
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(80, self._apply_resize)
+
+    def _apply_resize(self):
+        w = self._canvas.winfo_width()
+        h = self._canvas.winfo_height()
+        if w > 1 and h > 1:
+            self._dw = w
+            self._dh = h
+            self._scale = min(w / self._iw, h / self._ih)
+            self._refresh_canvas()
+
+    def _bright_bkg(self) -> np.ndarray:
+        """Contrast-stretch + gentle gamma lift for display."""
+        bkg = self._roi_bkg.astype(np.float32)
+        lo  = np.percentile(bkg, 25)
+        hi  = np.percentile(bkg, 95)
+        if hi > lo:
+            bkg = np.clip((bkg - lo) / (hi - lo), 0, 1)
+        else:
+            bkg = np.zeros_like(bkg)
+        bkg = np.power(bkg, 0.8) * 255  # gamma 0.7 — moderate midtone lift
+        return np.clip(bkg, 0, 255).astype(np.uint8)
+
     def _refresh_canvas(self):
         from PIL import Image as PILImage, ImageTk
+        bkg_bright = self._bright_bkg()
+        dw, dh = self._dw, self._dh
+
+        # reference: bright background only
+        pil_ref = PILImage.fromarray(bkg_bright).resize((dw, dh), PILImage.BILINEAR)
+        self._tk_ref = ImageTk.PhotoImage(pil_ref)
+        if self._ref_id is None:
+            self._ref_id = self._canvas_ref.create_image(0, 0, anchor="nw", image=self._tk_ref)
+        else:
+            self._canvas_ref.itemconfig(self._ref_id, image=self._tk_ref)
+
+        # interactive: bright background + ROI colour overlay
         combined = np.clip(
-            self._roi_bkg.astype(np.int16) + self._roi_msk.astype(np.int16), 0, 255
+            bkg_bright.astype(np.int16) + self._roi_msk.astype(np.int16), 0, 255
         ).astype(np.uint8)
-        pil = PILImage.fromarray(combined).resize((self._dw, self._dh), PILImage.NEAREST)
-        self._tk_img = ImageTk.PhotoImage(pil)
+        pil_roi = PILImage.fromarray(combined).resize((dw, dh), PILImage.BILINEAR)
+        self._tk_img = ImageTk.PhotoImage(pil_roi)
         if self._img_id is None:
             self._img_id = self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
         else:
@@ -530,14 +588,10 @@ class PipelineGUI(ctk.CTk):
         folder = Path(folder)
         prov = _read_provenance(str(folder))
 
-        # fill subject + output from provenance if available, otherwise from path
-        stored_outdir = prov.get("output_dir", "")
-        if stored_outdir:
-            self.output_var.set(str(Path(stored_outdir).parent))
-            self.subject_var.set(Path(stored_outdir).name)
-        else:
-            self.output_var.set(str(folder.parent))
-            self.subject_var.set(folder.name)
+        # Always derive output and subject from the folder the user selected,
+        # not from the path stored in provenance (which may be from another PC).
+        self.output_var.set(str(folder.parent))
+        self.subject_var.set(folder.name)
 
         # restore session paths
         load_args = prov.get("load_data") or {}
