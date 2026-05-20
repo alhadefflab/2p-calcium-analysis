@@ -73,6 +73,7 @@ Items marked ✅ have been patched. Items marked ❌ are open.
 - ✅ **`get_resp1_resp2` called with wrong number of arguments** — the per-animal loop in `analysis_again.py` was passing 2 arguments to a function that requires 3, crashing immediately on any multi-animal run. Fixed.
 - ✅ **Timing defined in frames instead of seconds** — frame indices were hardcoded as rounded integers, making it impossible to set stimulus timing without editing source code, and causing off-by-one errors when the frame period changed. All timing is now computed from seconds via `round(seconds / frame_period)` and exposed in the GUI.
 - ❌ **No false discovery rate correction** — responders are classified with a fixed z-score threshold of 1.64 (p < 0.05 one-tailed), applied independently to every neuron. With hundreds of neurons tested simultaneously, expected false positives accumulate. Reported counts should be treated as upper bounds; neurons just above the threshold are the most likely to be noise. Standard fix is Benjamini–Hochberg FDR correction.
+- ❌ **Pipeline hardcoded for exactly 2 stimuli** — `get_stims1_stims2` and `get_resp1_resp2` assume exactly two concatenated sessions (e.g. fructose + glucose). Single-stimulus experiments and experiments with 3+ conditions are not supported without manually rewriting the analysis functions. The GUI's `AnimalRow` widget also has fixed Session 1 / Session 2 fields. Deferred to the planned full rebuild.
 
 ### Code quality / environment
 
