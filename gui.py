@@ -8,6 +8,7 @@ import threading
 import traceback
 from pathlib import Path
 
+import tkinter as tk
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import numpy as np
@@ -105,88 +106,396 @@ class AnimalRow(ctk.CTkFrame):
         self.sess2_var.set(s2)
 
 
-# ── ROI editor popup ──────────────────────────────────────────────────────────
+# ── ROI curation window ───────────────────────────────────────────────────────
 
 class ROIEditorWindow(ctk.CTkToplevel):
-    """Popup shown during source extraction for manual ROI review."""
+    """Integrated ROI curation: remove, add, and region-exclusion in one window."""
 
-    def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish):
+    _REMOVE = "remove"
+    _ADD    = "add"
+    _REGION = "region"
+
+    _INSTRUCTIONS = {
+        "remove": (
+            "RIGHT-CLICK on a colored patch to remove that neuron.\n\n"
+            "The patch disappears immediately.\n\n"
+            "Use Undo to restore the last change."
+        ),
+        "add": (
+            "LEFT-CLICK and DRAG to paint a new neuron.\n\n"
+            "Fill the entire soma — do not just trace the outline.\n\n"
+            "Release the mouse to confirm."
+        ),
+        "region": (
+            "LEFT-CLICK to place polygon vertices around the region to KEEP "
+            "(e.g. draw around the DVC).\n\n"
+            "RIGHT-CLICK to close the polygon.\n\n"
+            "Neurons whose centres fall outside are removed."
+        ),
+    }
+
+    def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish,
+                 display_settings=None):
         super().__init__(parent)
-        self.title(f"ROI Editor — {z}")
+        self.title(f"ROI Curation — {z}")
         self.resizable(True, True)
         self.lift()
         self.focus_force()
 
-        self._z            = z
-        self._roi_masks    = roi_masks.copy()
-        self._roi_img_bkg  = roi_img_bkg.copy()
-        self._roi_img_mask = roi_img_mask.copy()
-        self._mc_corr_file = mc_corr_file
-        self._on_finish    = on_finish
+        self._on_finish = on_finish
+        self._roi_masks = roi_masks.copy()
+        self._roi_bkg   = roi_img_bkg.copy()
+        self._roi_msk   = roi_img_mask.copy()
 
-        self._img_label = ctk.CTkLabel(self, text="")
-        self._img_label.pack(padx=10, pady=10)
-        self._refresh_image()
+        h, w = roi_img_bkg.shape[:2]
+        self._ih, self._iw = h, w
+        # initial scale — will be updated when window maximises and Configure fires
+        self._scale = 500 / max(h, w)
+        self._dh = int(h * self._scale)
+        self._dw = int(w * self._scale)
 
-        btn_frame = ctk.CTkFrame(self)
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(btn_frame, text="Remove Neurons",
-                      command=self._do_remove).pack(side="left", padx=8, pady=6)
-        ctk.CTkButton(btn_frame, text="Add Neuron",
-                      command=self._do_add).pack(side="left", padx=8, pady=6)
-        ctk.CTkButton(btn_frame, text="Finish",
-                      fg_color="#2d6a2d", hover_color="#1e4d1e",
-                      command=self._do_finish).pack(side="right", padx=8, pady=6)
+        self._mode      = None
+        self._new_mask  = None
+        self._add_col   = None
+        self._poly_pts  = []
+        self._poly_ids  = []
+        self._history   = []
+        self._img_id    = None
+        self._ref_id    = None
+
+        ds = display_settings or {}
+        self._gamma_var  = tk.DoubleVar(value=ds.get("gamma",   1.36))
+        self._lo_var     = tk.DoubleVar(value=ds.get("lo_pct",  26.7))
+        self._hi_var     = tk.DoubleVar(value=ds.get("hi_pct",  98.8))
+
+        self._build_ui()
+        self._set_mode(self._REMOVE)
+        self.after(50, lambda: self.state('zoomed'))  # open maximised
+
+    # ── build ─────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = ctk.CTkFrame(self)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)  # canvas area expands
+        outer.columnconfigure(1, weight=0)  # panel stays fixed
+
+        # ── canvas area (left two thirds) ─────────────────────────────────────
+        canvas_area = ctk.CTkFrame(outer)
+        canvas_area.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        canvas_area.rowconfigure(1, weight=1)
+        canvas_area.columnconfigure(0, weight=1)
+        canvas_area.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(canvas_area, text="Reference  (no ROIs)",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, pady=(4, 2))
+        ctk.CTkLabel(canvas_area, text="ROIs  (interactive)",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, pady=(4, 2))
+
+        self._canvas_ref = tk.Canvas(canvas_area, bg="black", highlightthickness=0)
+        self._canvas_ref.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+
+        self._canvas = tk.Canvas(canvas_area, bg="black", highlightthickness=0)
+        self._canvas.grid(row=1, column=1, sticky="nsew")
+        self._canvas.bind("<Configure>",       self._on_canvas_resize)
+        self._canvas.bind("<Button-3>",        self._on_right)
+        self._canvas.bind("<Button-1>",        self._on_left_dn)
+        self._canvas.bind("<B1-Motion>",       self._on_left_mv)
+        self._canvas.bind("<ButtonRelease-1>", self._on_left_up)
+
+        panel = ctk.CTkFrame(outer, width=220)
+        panel.grid(row=0, column=1, sticky="nsew")
+        panel.grid_propagate(False)
+
+        ctk.CTkLabel(panel, text="Mode",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(12, 6), padx=10)
+
+        self._mode_btns = {}
+        for key, lbl in [(self._REMOVE, "Remove Neurons"),
+                          (self._ADD,    "Add Neuron"),
+                          (self._REGION, "Exclude Region")]:
+            b = ctk.CTkButton(panel, text=lbl, width=190,
+                               command=lambda k=key: self._set_mode(k))
+            b.pack(pady=3, padx=10)
+            self._mode_btns[key] = b
+
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+
+        self._instr = ctk.CTkLabel(panel, text="", wraplength=200,
+                                    justify="left", anchor="nw")
+        self._instr.pack(padx=10, fill="x")
+
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+
+        self._status = ctk.CTkLabel(panel, text="", wraplength=200,
+                                     text_color="#aaaaaa", anchor="w")
+        self._status.pack(padx=10, fill="x")
+
+        # ── display settings sliders ──────────────────────────────────────────
+        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(panel, text="Display Settings",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(0, 4))
+
+        def _make_slider(label, var, from_, to, steps):
+            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=2)
+            val_lbl = ctk.CTkLabel(row, width=38, anchor="e",
+                                   text=f"{var.get():.2f}")
+            def _on_change(v, lbl=val_lbl, variable=var):
+                variable.set(float(v))
+                lbl.configure(text=f"{float(v):.2f}")
+                self._refresh_canvas()
+            ctk.CTkLabel(row, text=label, width=82, anchor="w").pack(side="left")
+            ctk.CTkSlider(row, from_=from_, to=to, number_of_steps=steps,
+                          variable=var, command=_on_change,
+                          width=80).pack(side="left", padx=4)
+            val_lbl.pack(side="left")
+
+        _make_slider("Gamma",      self._gamma_var, 0.2, 1.5, 130)
+        _make_slider("Dark clip%", self._lo_var,    0.0, 30.0, 300)
+        _make_slider("Bright clip%", self._hi_var,  70.0, 100.0, 300)
+        # ─────────────────────────────────────────────────────────────────────
+
+        ctk.CTkButton(panel, text="Finish ✓", width=190,
+                       fg_color="#2d6a2d", hover_color="#1e4d1e",
+                       command=self._do_finish).pack(side="bottom", padx=10, pady=4)
+        ctk.CTkButton(panel, text="Undo", width=190,
+                       command=self._undo).pack(side="bottom", padx=10, pady=4)
 
         self.protocol("WM_DELETE_WINDOW", self._do_finish)
 
-    def _refresh_image(self):
-        from PIL import Image as PILImage
+    # ── mode ──────────────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode):
+        self._mode    = mode
+        self._new_mask = None
+        self._add_col  = None
+        for pid in self._poly_ids:
+            self._canvas.delete(pid)
+        self._poly_pts = []
+        self._poly_ids = []
+
+        for k, btn in self._mode_btns.items():
+            btn.configure(fg_color="#1a5276" if k == mode else ("#3b8ed0", "#1f6aa5"))
+        self._instr.configure(text=self._INSTRUCTIONS.get(mode, ""))
+        self._status.configure(text="")
+
+    # ── canvas ────────────────────────────────────────────────────────────────
+
+    def _on_canvas_resize(self, event):
+        if hasattr(self, '_resize_job'):
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(80, self._apply_resize)
+
+    def _apply_resize(self):
+        w = self._canvas.winfo_width()
+        h = self._canvas.winfo_height()
+        if w > 1 and h > 1:
+            self._dw = w
+            self._dh = h
+            self._scale = min(w / self._iw, h / self._ih)
+            self._refresh_canvas()
+
+    def _bright_bkg(self) -> np.ndarray:
+        """Contrast-stretch + gamma lift using slider-controlled parameters."""
+        bkg   = self._roi_bkg.astype(np.float32)
+        lo    = np.percentile(bkg, self._lo_var.get())
+        hi    = np.percentile(bkg, self._hi_var.get())
+        gamma = self._gamma_var.get()
+        if hi > lo:
+            bkg = np.clip((bkg - lo) / (hi - lo), 0, 1)
+        else:
+            bkg = np.zeros_like(bkg)
+        bkg = np.power(bkg, gamma) * 255
+        return np.clip(bkg, 0, 255).astype(np.uint8)
+
+    def _refresh_canvas(self):
+        from PIL import Image as PILImage, ImageTk
+        bkg_bright = self._bright_bkg()
+        dw, dh = self._dw, self._dh
+
+        # reference: bright background only
+        pil_ref = PILImage.fromarray(bkg_bright).resize((dw, dh), PILImage.BILINEAR)
+        self._tk_ref = ImageTk.PhotoImage(pil_ref)
+        if self._ref_id is None:
+            self._ref_id = self._canvas_ref.create_image(0, 0, anchor="nw", image=self._tk_ref)
+        else:
+            self._canvas_ref.itemconfig(self._ref_id, image=self._tk_ref)
+
+        # interactive: bright background + ROI colour overlay
         combined = np.clip(
-            self._roi_img_bkg.astype(int) + self._roi_img_mask.astype(int), 0, 255
+            bkg_bright.astype(np.int16) + self._roi_msk.astype(np.int16), 0, 255
         ).astype(np.uint8)
-        pil_img = PILImage.fromarray(combined)
-        h, w = combined.shape[:2]
-        size = 600
-        scale = size / max(h, w)
-        nw, nh = int(w * scale), int(h * scale)
-        pil_img = pil_img.resize((nw, nh), PILImage.LANCZOS)
-        self._ctk_img = ctk.CTkImage(pil_img, size=(nw, nh))
-        self._img_label.configure(image=self._ctk_img, text="")
+        pil_roi = PILImage.fromarray(combined).resize((dw, dh), PILImage.BILINEAR)
+        self._tk_img = ImageTk.PhotoImage(pil_roi)
+        if self._img_id is None:
+            self._img_id = self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+        else:
+            self._canvas.itemconfig(self._img_id, image=self._tk_img)
+        self._canvas.tag_lower(self._img_id)
 
-    def _do_remove(self):
-        from pipeline_utils import remove_neurons
-        neurons, ms = remove_neurons(
-            self._roi_masks, self._roi_img_bkg, self._roi_img_mask.copy(), title=self._z)
-        if neurons and messagebox.askyesno(
-                "Confirm removal",
-                f"Remove {len(neurons)} selected neuron(s)?",
+    def _c2i(self, cx, cy):
+        return int(cx / self._scale), int(cy / self._scale)
+
+    def _flat(self, ix, iy):
+        return ix * self._ih + iy
+
+    # ── remove ────────────────────────────────────────────────────────────────
+
+    def _on_right(self, event):
+        if self._mode == self._REMOVE:
+            ix, iy = self._c2i(event.x, event.y)
+            if not (0 <= ix < self._iw and 0 <= iy < self._ih):
+                return
+            flat = self._flat(ix, iy)
+            if flat >= self._roi_masks.shape[0]:
+                return
+            row = self._roi_masks[flat]
+            if row.sum() != 1:
+                return
+            self._push_history()
+            nidx = int(np.argmax(row))
+            pxs = self._roi_masks[:, nidx].reshape((self._ih, self._iw), order='F')
+            self._roi_msk[pxs] = 0
+            self._roi_masks = np.delete(self._roi_masks, nidx, 1)
+            self._status.configure(text=f"Removed. Total: {self._roi_masks.shape[1]}")
+            self._refresh_canvas()
+        elif self._mode == self._REGION:
+            self._close_polygon()
+
+    # ── add ───────────────────────────────────────────────────────────────────
+
+    def _on_left_dn(self, event):
+        if self._mode == self._ADD:
+            self._new_mask = np.zeros((self._ih, self._iw), dtype=bool)
+            self._add_col  = tuple(np.random.randint(40, 210, 3).tolist())
+            self._paint(event.x, event.y)
+        elif self._mode == self._REGION:
+            self._add_poly_pt(event.x, event.y)
+
+    def _on_left_mv(self, event):
+        if self._mode == self._ADD and self._new_mask is not None:
+            self._paint(event.x, event.y)
+
+    def _paint(self, cx, cy):
+        ix, iy = self._c2i(cx, cy)
+        br = 5
+        for dx in range(-br, br + 1):
+            for dy in range(-br, br + 1):
+                px, py = ix + dx, iy + dy
+                if 0 <= px < self._iw and 0 <= py < self._ih:
+                    self._new_mask[py, px] = True
+        r = max(2, int(br * self._scale))
+        col = "#{:02x}{:02x}{:02x}".format(*self._add_col)
+        self._canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                  fill=col, outline=col, tags="paint")
+
+    def _on_left_up(self, event):
+        if self._mode != self._ADD or self._new_mask is None:
+            return
+        if not self._new_mask.any():
+            self._new_mask = None
+            return
+        confirmed = messagebox.askyesno(
+            "Add neuron", "Add this painted region as a new neuron?", parent=self)
+        self._canvas.delete("paint")
+        if confirmed:
+            self._push_history()
+            flat_col = self._new_mask.flatten('F').reshape(-1, 1)
+            self._roi_masks = np.concatenate([self._roi_masks, flat_col], axis=1)
+            self._roi_msk[self._new_mask] = np.array(self._add_col, dtype=np.uint8)
+            self._status.configure(text=f"Added. Total: {self._roi_masks.shape[1]}")
+        self._new_mask = None
+        self._add_col  = None
+        self._refresh_canvas()
+
+    # ── region exclusion ──────────────────────────────────────────────────────
+
+    def _add_poly_pt(self, cx, cy):
+        dot = self._canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                        fill="yellow", outline="yellow", tags="poly")
+        self._poly_ids.append(dot)
+        if self._poly_pts:
+            px, py = self._poly_pts[-1]
+            ln = self._canvas.create_line(px, py, cx, cy,
+                                           fill="yellow", width=2, tags="poly")
+            self._poly_ids.append(ln)
+        self._poly_pts.append((cx, cy))
+        self._status.configure(
+            text=f"{len(self._poly_pts)} point(s). Right-click to close.")
+
+    def _close_polygon(self):
+        if len(self._poly_pts) < 3:
+            self._status.configure(text="Need at least 3 points first.")
+            return
+        px, py = self._poly_pts[-1]
+        fx, fy = self._poly_pts[0]
+        self._poly_ids.append(
+            self._canvas.create_line(px, py, fx, fy,
+                                      fill="yellow", width=2, tags="poly"))
+
+        from PIL import Image as PILImage, ImageDraw
+        poly_img = [(int(cx / self._scale), int(cy / self._scale))
+                    for cx, cy in self._poly_pts]
+        pmask = PILImage.new('L', (self._iw, self._ih), 0)
+        ImageDraw.Draw(pmask).polygon(poly_img, fill=255)
+        inside = np.array(pmask, dtype=bool)
+
+        n = self._roi_masks.shape[1]
+        keep = np.ones(n, dtype=bool)
+        for i in range(n):
+            pxs = self._roi_masks[:, i].reshape((self._ih, self._iw), order='F')
+            ys, xs = np.where(pxs)
+            if len(xs) == 0:
+                keep[i] = False
+                continue
+            keep[i] = inside[int(ys.mean()), int(xs.mean())]
+
+        removed = int((~keep).sum())
+        if removed > 0 and messagebox.askyesno(
+                "Exclude region",
+                f"Remove {removed} neuron(s) outside the polygon?",
                 parent=self):
-            self._roi_masks = np.delete(self._roi_masks, neurons, 1)
-            self._roi_img_mask = ms
-            self._refresh_image()
+            self._push_history()
+            for i in np.where(~keep)[0]:
+                pxs = self._roi_masks[:, i].reshape((self._ih, self._iw), order='F')
+                self._roi_msk[pxs] = 0
+            self._roi_masks = self._roi_masks[:, keep]
+            self._status.configure(
+                text=f"Excluded {removed}. Total: {self._roi_masks.shape[1]}")
+            self._refresh_canvas()
+        elif removed == 0:
+            self._status.configure(text="All neurons are inside the polygon.")
 
-    def _do_add(self):
-        try:
-            import caiman as cm
-            from pipeline_utils import draw_masks
-            Yr, dims, T = cm.load_memmap(self._mc_corr_file)
-            mc_data = np.reshape(Yr.T, [T] + list(dims), order='F')
-            ms, mask = draw_masks(
-                self._roi_img_bkg, self._roi_img_mask.copy(),
-                np.zeros(mc_data.shape[-2:], np.uint8),
-                show_plot=False, title=self._z)
-            if messagebox.askyesno("Confirm addition", "Add this neuron?", parent=self):
-                self._roi_masks = np.concatenate(
-                    [self._roi_masks, mask.reshape((-1, 1), order='F')], axis=1)
-                self._roi_img_mask = ms
-                self._refresh_image()
-        except Exception as exc:
-            messagebox.showerror("Add Neuron failed", str(exc), parent=self)
+        for pid in self._poly_ids:
+            self._canvas.delete(pid)
+        self._poly_ids = []
+        self._poly_pts = []
+
+    # ── undo / finish ─────────────────────────────────────────────────────────
+
+    def _push_history(self):
+        self._history.append((self._roi_masks.copy(), self._roi_msk.copy()))
+        if len(self._history) > 20:
+            self._history.pop(0)
+
+    def _undo(self):
+        if not self._history:
+            self._status.configure(text="Nothing to undo.")
+            return
+        self._roi_masks, self._roi_msk = self._history.pop()
+        self._status.configure(text=f"Undone. Total: {self._roi_masks.shape[1]}")
+        self._refresh_canvas()
 
     def _do_finish(self):
         clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
-        self._on_finish(clean, self._roi_img_bkg, self._roi_img_mask)
+        settings = {
+            "gamma":  round(self._gamma_var.get(), 3),
+            "lo_pct": round(self._lo_var.get(),    3),
+            "hi_pct": round(self._hi_var.get(),    3),
+        }
+        self._on_finish(clean, self._roi_bkg, self._roi_msk, settings)
         self.destroy()
 
 
@@ -239,7 +548,7 @@ class PipelineGUI(ctk.CTk):
                      placeholder_text="e.g. ZH511").grid(
             row=0, column=1, padx=8, sticky="w")
 
-        ctk.CTkLabel(top, text="Output / project folder:", width=130, anchor="w").grid(
+        ctk.CTkLabel(top, text="Project Folder:", width=130, anchor="w").grid(
             row=1, column=0, pady=5, sticky="w")
         self.output_var = ctk.StringVar()
         self.output_var.trace_add("write", lambda *_: self._check_provenance())
@@ -248,6 +557,16 @@ class PipelineGUI(ctk.CTk):
             row=1, column=1, padx=8, sticky="w")
         ctk.CTkButton(top, text="Browse", width=80,
                       command=self._browse_output).grid(row=1, column=2, padx=4)
+
+        ctk.CTkLabel(top, text="Analysis output\n(optional):", width=130,
+                     anchor="w", text_color="gray").grid(
+            row=2, column=0, pady=5, sticky="w")
+        self.analysis_out_var = ctk.StringVar()
+        ctk.CTkEntry(top, textvariable=self.analysis_out_var, width=320,
+                     placeholder_text="Default: <project folder>/analysis/  — override here if needed").grid(
+            row=2, column=1, padx=8, sticky="w")
+        ctk.CTkButton(top, text="Browse", width=80,
+                      command=self._browse_analysis_out).grid(row=2, column=2, padx=4)
 
         # provenance status indicator
         self.prov_label = ctk.CTkLabel(tab, text="", text_color="gray")
@@ -302,9 +621,14 @@ class PipelineGUI(ctk.CTk):
             r.index = i
 
     def _browse_output(self):
-        path = filedialog.askdirectory(title="Select output / project folder")
+        path = filedialog.askdirectory(title="Project Folder")
         if path:
             self.output_var.set(path)
+
+    def _browse_analysis_out(self):
+        path = filedialog.askdirectory(title="Select analysis results folder  (optional)")
+        if path:
+            self.analysis_out_var.set(path)
 
     # ── project loading & provenance detection ─────────────────────────────
 
@@ -316,14 +640,10 @@ class PipelineGUI(ctk.CTk):
         folder = Path(folder)
         prov = _read_provenance(str(folder))
 
-        # fill subject + output from provenance if available, otherwise from path
-        stored_outdir = prov.get("output_dir", "")
-        if stored_outdir:
-            self.output_var.set(str(Path(stored_outdir).parent))
-            self.subject_var.set(Path(stored_outdir).name)
-        else:
-            self.output_var.set(str(folder.parent))
-            self.subject_var.set(folder.name)
+        # Always derive output and subject from the folder the user selected,
+        # not from the path stored in provenance (which may be from another PC).
+        self.output_var.set(str(folder.parent))
+        self.subject_var.set(folder.name)
 
         # restore session paths
         load_args = prov.get("load_data") or {}
@@ -565,7 +885,7 @@ class PipelineGUI(ctk.CTk):
 
         ctk.CTkLabel(tab,
                      text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.\n"
-                          "Results are saved automatically to  <project folder>/analysis/",
+                          "Results are saved to  <project folder>/analysis/  (or the custom analysis folder set in tab 1).",
                      text_color="gray", wraplength=740).pack(anchor="w", padx=22, pady=4)
 
         self.run_btn = ctk.CTkButton(tab, text="▶   Run",
@@ -620,6 +940,7 @@ class PipelineGUI(ctk.CTk):
 
         return dict(
             subject=subject, output=output, animals=animals,
+            analysis_out=self.analysis_out_var.get().strip(),
             frame_period=fp, pre_discard_s=pre_s, baseline_s=base_s,
             stim_s=stim_s, threshold=threshold, z_planes=z_planes,
             ch_dict={"mc_ch": self.mc_ch_var.get().strip(),
@@ -649,23 +970,40 @@ class PipelineGUI(ctk.CTk):
 
     def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
         """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
+        import yaml
         # Resolve relative mmap path — provenance may store it relative to the project root
         if not Path(mc_corr_file).is_absolute():
             mc_corr_file = str(Path(output_dir) / Path(mc_corr_file).name)
+
+        # Load persisted display settings (carry over from previous z-plane)
+        ds_path = Path(output_dir) / 'display_settings.yaml'
+        if not hasattr(self, '_display_settings'):
+            if ds_path.exists():
+                with open(ds_path, 'r') as f:
+                    self._display_settings = yaml.safe_load(f) or {}
+            else:
+                self._display_settings = {}
 
         result_holder = [None]
         done = threading.Event()
 
         def _show():
-            def _on_finish(masks, bkg, mask_img):
-                result_holder[0] = (masks, bkg, mask_img)
+            def _on_finish(masks, bkg, mask_img, settings):
+                result_holder[0] = (masks, bkg, mask_img, settings)
                 done.set()
-            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, _on_finish)
+            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
+                            _on_finish, display_settings=self._display_settings)
 
         self.after(0, _show)
         done.wait()
 
-        new_masks, new_bkg, new_mask_img = result_holder[0]
+        new_masks, new_bkg, new_mask_img, settings = result_holder[0]
+
+        # Persist settings for next z-plane and save to project folder
+        self._display_settings = settings
+        with open(ds_path, 'w') as f:
+            yaml.dump(settings, f)
+
         roi_masks_file = Path(output_dir) / 'concat_roi-masks.npy'
         np.save(roi_masks_file, new_masks)
         return new_masks, roi_masks_file, new_bkg, new_mask_img
@@ -784,10 +1122,11 @@ class PipelineGUI(ctk.CTk):
             f"Total responsive: {n_total} / {all_stims1.shape[0]}"
         )
 
-        # save results
+        # save results — use custom analysis output folder if the user specified one
         out_dir = str(Path(p["output"]) / p["subject"])
+        results_parent = p["analysis_out"] if p["analysis_out"] else out_dir
         results_dir = self._save_results(
-            out_dir, resp1, resp2, nums, z_ids_sel, p,
+            results_parent, resp1, resp2, nums, z_ids_sel, p,
             stim_onset_idx, d["ses_f"])
         self._log(f"Results saved to  {results_dir}")
 
