@@ -548,7 +548,7 @@ class PipelineGUI(ctk.CTk):
                      placeholder_text="e.g. ZH511").grid(
             row=0, column=1, padx=8, sticky="w")
 
-        ctk.CTkLabel(top, text="Output / project folder:", width=130, anchor="w").grid(
+        ctk.CTkLabel(top, text="Project Folder:", width=130, anchor="w").grid(
             row=1, column=0, pady=5, sticky="w")
         self.output_var = ctk.StringVar()
         self.output_var.trace_add("write", lambda *_: self._check_provenance())
@@ -557,6 +557,16 @@ class PipelineGUI(ctk.CTk):
             row=1, column=1, padx=8, sticky="w")
         ctk.CTkButton(top, text="Browse", width=80,
                       command=self._browse_output).grid(row=1, column=2, padx=4)
+
+        ctk.CTkLabel(top, text="Analysis output\n(optional):", width=130,
+                     anchor="w", text_color="gray").grid(
+            row=2, column=0, pady=5, sticky="w")
+        self.analysis_out_var = ctk.StringVar()
+        ctk.CTkEntry(top, textvariable=self.analysis_out_var, width=320,
+                     placeholder_text="Default: <project folder>/analysis/  — override here if needed").grid(
+            row=2, column=1, padx=8, sticky="w")
+        ctk.CTkButton(top, text="Browse", width=80,
+                      command=self._browse_analysis_out).grid(row=2, column=2, padx=4)
 
         # provenance status indicator
         self.prov_label = ctk.CTkLabel(tab, text="", text_color="gray")
@@ -611,9 +621,14 @@ class PipelineGUI(ctk.CTk):
             r.index = i
 
     def _browse_output(self):
-        path = filedialog.askdirectory(title="Select output / project folder")
+        path = filedialog.askdirectory(title="Project Folder")
         if path:
             self.output_var.set(path)
+
+    def _browse_analysis_out(self):
+        path = filedialog.askdirectory(title="Select analysis results folder  (optional)")
+        if path:
+            self.analysis_out_var.set(path)
 
     # ── project loading & provenance detection ─────────────────────────────
 
@@ -870,7 +885,7 @@ class PipelineGUI(ctk.CTk):
 
         ctk.CTkLabel(tab,
                      text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.\n"
-                          "Results are saved automatically to  <project folder>/analysis/",
+                          "Results are saved to  <project folder>/analysis/  (or the custom analysis folder set in tab 1).",
                      text_color="gray", wraplength=740).pack(anchor="w", padx=22, pady=4)
 
         self.run_btn = ctk.CTkButton(tab, text="▶   Run",
@@ -925,6 +940,7 @@ class PipelineGUI(ctk.CTk):
 
         return dict(
             subject=subject, output=output, animals=animals,
+            analysis_out=self.analysis_out_var.get().strip(),
             frame_period=fp, pre_discard_s=pre_s, baseline_s=base_s,
             stim_s=stim_s, threshold=threshold, z_planes=z_planes,
             ch_dict={"mc_ch": self.mc_ch_var.get().strip(),
@@ -1106,10 +1122,11 @@ class PipelineGUI(ctk.CTk):
             f"Total responsive: {n_total} / {all_stims1.shape[0]}"
         )
 
-        # save results
+        # save results — use custom analysis output folder if the user specified one
         out_dir = str(Path(p["output"]) / p["subject"])
+        results_parent = p["analysis_out"] if p["analysis_out"] else out_dir
         results_dir = self._save_results(
-            out_dir, resp1, resp2, nums, z_ids_sel, p,
+            results_parent, resp1, resp2, nums, z_ids_sel, p,
             stim_onset_idx, d["ses_f"])
         self._log(f"Results saved to  {results_dir}")
 
