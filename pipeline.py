@@ -461,7 +461,7 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
         plt.imshow(func_lc)
 
     ###
-    model = models.Cellpose(model_type=model_type, gpu=False)
+    model = models.Cellpose(model_type=model_type, gpu=True)
     masks, _, _, _ = model.eval(func_lc,  diameter= diameter, channels=channels, 
                                 flow_threshold = flow_threshold,
                                 cellprob_threshold = cellprob_threshold)

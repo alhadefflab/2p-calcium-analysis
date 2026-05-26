@@ -75,7 +75,7 @@ CNMF_PARAMS = {
     'only_init':False, #must be false for seeded mode
     'min_SNR': 2.0,
     'use_cnn': False, # whether or not to use a convolutional neural network to classify rois as good or bad
-    'use_cuda':False, # whether or not to use GPUs
+    'use_cuda':True, # whether or not to use GPUs
 
     ## the rest of these are necessary parameters to set for that get ignored
     ## since we are seeding the algorithm for initialization
