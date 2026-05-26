@@ -253,29 +253,35 @@ def _save_rigid_motion_correction_video(output_dir, func_ch, func_ch_file, z, pa
 
 
 def _visualize_rigcorr_results(mc, mc_ch, mc_ch_file, figbasename):
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-    #1. 
-    plt.figure()
-    plt.plot(np.array(mc.shifts_rig)[:,0], label = 'x shifts')
-    plt.plot(np.array(mc.shifts_rig)[:,1], label = 'y shifts')
-    plt.legend()
-    plt.xlabel('frames')
-    plt.ylabel('pixels')
+    def _fig(*args, **kwargs):
+        fig = Figure(*args, **kwargs)
+        FigureCanvasAgg(fig)
+        return fig
 
-    plt.savefig(str(figbasename) + '_rigid-shifts.pdf')
+    #1.
+    fig = _fig()
+    ax = fig.add_subplot(111)
+    ax.plot(np.array(mc.shifts_rig)[:,0], label = 'x shifts')
+    ax.plot(np.array(mc.shifts_rig)[:,1], label = 'y shifts')
+    ax.legend()
+    ax.set_xlabel('frames')
+    ax.set_ylabel('pixels')
+    fig.savefig(str(figbasename) + '_rigid-shifts.pdf')
 
-    #2. 
+    #2.
     if mc.pw_rigid:
-        _,ax=plt.subplots(2,1)
+        fig = _fig()
+        ax = [fig.add_subplot(2,1,1), fig.add_subplot(2,1,2)]
         ax[0].plot(np.array(mc.x_shifts_els) - np.array(mc.shifts_rig)[:,0,None])
         ax[0].set_title('x shift deviations')
         ax[1].plot(np.array(mc.y_shifts_els) - np.array(mc.shifts_rig)[:,1,None])
         ax[1].set_title('y shift deviations')
+        fig.savefig(str(figbasename) + '_shift-deviations.pdf')
 
-        plt.savefig(str(figbasename) + '_shift-deviations.pdf')
-        
-    
-    #3. 
+    #3.
     corr2 = np.array(cm.load(mc.mmap_file))
     raw2 = np.array(cm.load_movie_chain([mc_ch_file]))
 
@@ -292,7 +298,8 @@ def _visualize_rigcorr_results(mc, mc_ch, mc_ch_file, figbasename):
     c = corr_m(c)
     r = corr_m(r)
 
-    fig, ax = plt.subplots(1,2, figsize = (10,5))
+    fig = _fig(figsize=(10,5))
+    ax = [fig.add_subplot(1,2,1), fig.add_subplot(1,2,2)]
     ax[0].plot(c, label = 'corrected')
     ax[0].plot(r, label = 'raw')
     ax[0].set(xlabel = 'Frame', ylabel = 'Correlation with Mean')
@@ -303,11 +310,11 @@ def _visualize_rigcorr_results(mc, mc_ch, mc_ch_file, figbasename):
     ylim = ax[1].get_ylim()
     nlim = ( min(xlim[0], ylim[0]), max(xlim[1], ylim[1]) )
     ax[1].plot(nlim, nlim, color = 'k', ls = '--')
-    ax[1].set( ylabel = 'Corrected', xlabel = 'Raw', 
-            title = 'Correlation with Mean', 
+    ax[1].set( ylabel = 'Corrected', xlabel = 'Raw',
+            title = 'Correlation with Mean',
             xlim = nlim, ylim = nlim)
 
-    sns.despine()
+    sns.despine(fig=fig)
     fig.tight_layout(pad = 1.)
     fig.savefig(str(figbasename) + '_correlation-with-mean.pdf')
 
