@@ -386,13 +386,11 @@ def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
     s2_2 = sorted(stims2[r_stim2only], key=lambda x : np.median(x[start:end]))
     s2_2 = np.array(s2_2)[::-1]
     
-    arrays1 = [s1_1, s1_12, s1_2]
-    arrays1 = [a for a in arrays1 if a.shape[0]>0]
-    resp1 = np.vstack(arrays1)
+    arrays1 = [a for a in [s1_1, s1_12, s1_2] if a.shape[0] > 0]
+    resp1 = np.vstack(arrays1) if arrays1 else np.empty((0, stims1.shape[1]))
 
-    arrays2 = [s2_1, s2_12, s2_2]
-    arrays2 = [a for a in arrays2 if a.shape[0]>0]
-    resp2 = np.vstack(arrays2)
+    arrays2 = [a for a in [s2_1, s2_12, s2_2] if a.shape[0] > 0]
+    resp2 = np.vstack(arrays2) if arrays2 else np.empty((0, stims2.shape[1]))
 
     nums = [r_stim1only.sum(), r_stim12.sum(), r_stim2only.sum()]
 

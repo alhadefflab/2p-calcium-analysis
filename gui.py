@@ -106,6 +106,12 @@ class AnimalRow(ctk.CTkFrame):
         self.sess2_var.set(s2)
 
 
+def _canvas_to_image(cx: float, cy: float,
+                     scale_x: float, scale_y: float) -> tuple:
+    """Convert canvas pixel (cx, cy) to image pixel (ix, iy) using per-axis scales."""
+    return int(cx / scale_x), int(cy / scale_y)
+
+
 # ── ROI curation window ───────────────────────────────────────────────────────
 
 class ROIEditorWindow(ctk.CTkToplevel):
@@ -149,10 +155,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
         h, w = roi_img_bkg.shape[:2]
         self._ih, self._iw = h, w
-        # initial scale — will be updated when window maximises and Configure fires
-        self._scale = 500 / max(h, w)
-        self._dh = int(h * self._scale)
-        self._dw = int(w * self._scale)
+        # initial scales — updated when window maximises and Configure fires
+        _s = 500 / max(h, w)
+        self._scale_x = _s
+        self._scale_y = _s
+        self._dh = int(h * _s)
+        self._dw = int(w * _s)
 
         self._mode      = None
         self._new_mask  = None
@@ -294,7 +302,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         if w > 1 and h > 1:
             self._dw = w
             self._dh = h
-            self._scale = min(w / self._iw, h / self._ih)
+            self._scale_x = w / self._iw
+            self._scale_y = h / self._ih
             self._refresh_canvas()
 
     def _bright_bkg(self) -> np.ndarray:
@@ -336,7 +345,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._canvas.tag_lower(self._img_id)
 
     def _c2i(self, cx, cy):
-        return int(cx / self._scale), int(cy / self._scale)
+        return _canvas_to_image(cx, cy, self._scale_x, self._scale_y)
 
     def _flat(self, ix, iy):
         return ix * self._ih + iy
@@ -386,7 +395,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
                 px, py = ix + dx, iy + dy
                 if 0 <= px < self._iw and 0 <= py < self._ih:
                     self._new_mask[py, px] = True
-        r = max(2, int(br * self._scale))
+        r = max(2, int(br * min(self._scale_x, self._scale_y)))
         col = "#{:02x}{:02x}{:02x}".format(*self._add_col)
         self._canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                                   fill=col, outline=col, tags="paint")
@@ -436,7 +445,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
                                       fill="yellow", width=2, tags="poly"))
 
         from PIL import Image as PILImage, ImageDraw
-        poly_img = [(int(cx / self._scale), int(cy / self._scale))
+        poly_img = [_canvas_to_image(cx, cy, self._scale_x, self._scale_y)
                     for cx, cy in self._poly_pts]
         pmask = PILImage.new('L', (self._iw, self._ih), 0)
         ImageDraw.Draw(pmask).polygon(poly_img, fill=255)
@@ -910,7 +919,7 @@ class PipelineGUI(ctk.CTk):
 
         output = self.output_var.get().strip()
         if not output:
-            errs.append("Output / proj\ect folder is required.")
+            errs.append("Output / project folder is required.")
 
         animals = []
         for r in self.animal_rows:

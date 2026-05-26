@@ -44,7 +44,11 @@ conda activate <env-name>
 
 ## Usage
 
-Install the GUI dependency, then launch `gui.py`:
+Install the GUI and test dependencies, then launch `gui.py`:
+
+```bash
+pip install customtkinter pytest
+```
 
 ```bash
 pip install customtkinter
@@ -83,7 +87,7 @@ Items marked ✅ have been patched. Items marked ❌ are open.
 - ❌ **`environment.yml` encoding and prefix** — the file is saved as UTF-16 LE, which `conda env create` cannot parse. It also contains a hardcoded `prefix:` path pointing to the original developer's machine that must be removed before install.
 - ❌ **`analysis_again.py` contains hardcoded subject/path references** — subject ID and data paths are hardcoded and must be edited manually for each experiment. The GUI replaces this workflow but the underlying script still has the hardcoded values.
 - ❌ **`scratch.py` has dead code** — references the old class-based `Pipeline` API which no longer exists, and contains duplicate variable assignments. The file does not run as-is.
-- ❌ **No unit tests** — correctness depends entirely on visual inspection of outputs.
+- ✅ **No unit tests** — unit and regression tests now exist in `tests/`. See [docs/testing.md](docs/testing.md).
 
 ## Data
 
