@@ -301,6 +301,38 @@ def why(provenance, cnm, center):
     out.release
 
 
+def _session_window_indices(ses1_len, pre_f, base_f, stim_f):
+    """Baseline/stim index windows for a 2-session concatenated recording.
+
+    Session 2 begins at ses1_len — the actual frame count of session 1 in
+    the concatenated stack, NOT a value derived from user-supplied stim_s.
+    stim_f sets how many post-baseline frames to analyze per session.
+    """
+    return dict(
+        bline1_start = pre_f,
+        bline1_end   = pre_f + base_f,
+        stim1_start  = pre_f + base_f,
+        stim1_end    = pre_f + base_f + stim_f,
+
+        bline2_start = ses1_len + pre_f,
+        bline2_end   = ses1_len + pre_f + base_f,
+        stim2_start  = ses1_len + pre_f + base_f,
+        stim2_end    = ses1_len + pre_f + base_f + stim_f,
+    )
+
+
+def _session_lengths(provenance, z):
+    """Per-session frame counts read from the affine-corrected TIFFs."""
+    from tifffile import TiffFile
+    aff_files = provenance['affine_motion_correction'][z]['filenames']
+    ch_files = next(iter(aff_files.values()))  # any channel — counts match across channels
+    lengths = []
+    for i in sorted(ch_files):
+        with TiffFile(str(ch_files[i])) as tf:
+            lengths.append(len(tf.pages))
+    return lengths
+
+
 def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
     stims1 = []
     stims2 = []
@@ -322,26 +354,35 @@ def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline
 
         #why(provenance, cnm, center)
 
-        #
         pre_f  = round(pre_discard_s / frame_period)
         base_f = round(baseline_s    / frame_period)
         stim_f = round(stim_s        / frame_period)
-        ses_f  = pre_f + base_f + stim_f
 
-        bline1_start, bline1_end = pre_f,            pre_f + base_f
-        stim1_start,  stim1_end  = bline1_end,       ses_f
-        bline2_start, bline2_end = ses_f + pre_f,    ses_f + pre_f + base_f
-        stim2_start,  stim2_end  = bline2_end,       2 * ses_f
+        # Anchor session-2 windows to the *real* session-1 length, not a value
+        # derived from stim_s. Mismatch here is the bug that made baselines
+        # leak across sessions.
+        ses1_len = _session_lengths(provenance, z)[0]
 
-        fl_acc1 = custom_df_f_startend(cnm, bline1_start, bline1_end, method='zscore', use_residuals=True)
-        fl_acc2 = custom_df_f_startend(cnm, bline2_start, bline2_end, method='zscore', use_residuals=True)
+        if pre_f + base_f + stim_f > ses1_len:
+            raise ValueError(
+                f"Session-1 analysis window ({pre_f + base_f + stim_f} frames) "
+                f"exceeds session-1 length ({ses1_len} frames). Reduce stim_s, "
+                f"baseline_s, or pre_discard_s."
+            )
+        if ses1_len + pre_f + base_f + stim_f > T:
+            raise ValueError(
+                f"Session-2 analysis window ends at frame "
+                f"{ses1_len + pre_f + base_f + stim_f} but the concatenated "
+                f"recording has only {T} frames."
+            )
 
-        stim1 = fl_acc1[:, bline1_start:stim1_end]  
-        stim2 = fl_acc2[:, bline2_start:stim2_end]
+        w = _session_window_indices(ses1_len, pre_f, base_f, stim_f)
 
-        #area_indices = select_subregions(img.copy(), cnm, ['Area 1']) 
-        #show_subregions(img, cnm, area_indices, ['red'])
-        #stim1area1 = stim1[area_indices[0], :]
+        fl_acc1 = custom_df_f_startend(cnm, w['bline1_start'], w['bline1_end'], method='zscore', use_residuals=True)
+        fl_acc2 = custom_df_f_startend(cnm, w['bline2_start'], w['bline2_end'], method='zscore', use_residuals=True)
+
+        stim1 = fl_acc1[:, w['bline1_start']:w['stim1_end']]
+        stim2 = fl_acc2[:, w['bline2_start']:w['stim2_end']]
 
         stims1.append(stim1)
         stims2.append(stim2)

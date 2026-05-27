@@ -7,7 +7,7 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 
-from pipeline_funcs import custom_df_f_startend, get_resp1_resp2
+from pipeline_funcs import custom_df_f_startend, get_resp1_resp2, _session_window_indices
 
 
 # ── mock CNMF object ──────────────────────────────────────────────────────────
@@ -252,3 +252,53 @@ class TestGetResp1Resp2:
         assert len(z_ids_sel[0]) == nums[0]
         assert len(z_ids_sel[1]) == nums[1]
         assert len(z_ids_sel[2]) == nums[2]
+
+
+# ── _session_window_indices ──────────────────────────────────────────────────
+#
+# These tests guard against the regression where session-2 windows were derived
+# from user-supplied stim_s instead of the real session-1 frame count, which
+# caused session-2 baselines to leak into session 1 when stim_s was too small.
+
+class TestSessionWindowIndices:
+
+    def test_session2_anchored_to_real_session_boundary(self):
+        # User-supplied stim_f (308) implies session-1 length of 410, but the
+        # real recording is 514 frames. Session 2 windows must use the real
+        # boundary (514), not 410.
+        ses1_len = 514
+        w = _session_window_indices(ses1_len, pre_f=51, base_f=51, stim_f=308)
+
+        assert w['bline2_start'] == 514 + 51
+        assert w['bline2_end']   == 514 + 51 + 51
+        assert w['stim2_start']  == 514 + 51 + 51
+        assert w['stim2_end']    == 514 + 51 + 51 + 308
+
+        # Critically: session-2 baseline cannot reach into session 1
+        assert w['bline2_start'] >= ses1_len
+
+    def test_session1_indices_do_not_depend_on_session_length(self):
+        w_short = _session_window_indices(400, 50, 50, 300)
+        w_long  = _session_window_indices(800, 50, 50, 300)
+        for k in ('bline1_start', 'bline1_end', 'stim1_start', 'stim1_end'):
+            assert w_short[k] == w_long[k]
+
+    def test_session2_offset_tracks_session1_length(self):
+        a = _session_window_indices(500, 30, 40, 200)
+        b = _session_window_indices(700, 30, 40, 200)
+        for k in ('bline2_start', 'bline2_end', 'stim2_start', 'stim2_end'):
+            assert b[k] - a[k] == 200
+
+    def test_window_shapes_match_between_sessions(self):
+        # Both stim slices must produce arrays of the same length so they can
+        # be compared neuron-by-neuron downstream.
+        w = _session_window_indices(514, 51, 51, 308)
+        assert w['stim1_end'] - w['bline1_start'] == w['stim2_end'] - w['bline2_start']
+        assert w['stim1_end'] - w['bline1_start'] == 51 + 308
+
+    def test_no_overlap_between_session1_and_session2_windows(self):
+        # Session-1 stim end must never reach into session-2's baseline.
+        ses1_len = 514
+        w = _session_window_indices(ses1_len, 51, 51, 308)
+        assert w['stim1_end'] <= ses1_len
+        assert w['bline2_start'] >= ses1_len

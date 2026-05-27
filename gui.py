@@ -672,6 +672,15 @@ class PipelineGUI(ctk.CTk):
         if isinstance(mc_prov, dict) and mc_prov:
             self.z_planes_var.set(",".join(mc_prov.keys()))
 
+        # restore timing params if a previous analysis was saved
+        ap = prov.get("analysis_params") or {}
+        if ap:
+            if "frame_period"  in ap: self.frame_period_var.set(str(ap["frame_period"]))
+            if "pre_discard_s" in ap: self.pre_discard_var.set(str(ap["pre_discard_s"]))
+            if "baseline_s"    in ap: self.baseline_var.set(str(ap["baseline_s"]))
+            if "stim_s"        in ap: self.stim_var.set(str(ap["stim_s"]))
+            if "threshold"     in ap: self.threshold_var.set(str(ap["threshold"]))
+
         self._check_provenance()
         self.tabs.set("Run")
 
@@ -851,15 +860,12 @@ class PipelineGUI(ctk.CTk):
             d = _frame_layout(fp, pre, bl, st)
             pf, bf, sf, se = d["pre_f"], d["base_f"], d["stim_f"], d["ses_f"]
             self.layout_label.configure(text=(
-                f"  Per session : {se} frames  "
-                f"({pf} discard + {bf} baseline + {sf} stim)\n"
-                f"  Full file   : {2 * se} frames  (session 1 + session 2)\n\n"
-                f"  Session 1   discard  0–{pf-1}   "
-                f"baseline  {pf}–{pf+bf-1}   "
-                f"stimulus  {pf+bf}–{se-1}\n"
-                f"  Session 2   discard  {se}–{se+pf-1}   "
-                f"baseline  {se+pf}–{se+pf+bf-1}   "
-                f"stimulus  {se+pf+bf}–{2*se-1}"
+                f"  Each session is analysed independently from local frame 0:\n\n"
+                f"  discard   frames  0 – {pf-1}        ({pf} frames,  ~{pre:.0f} s)\n"
+                f"  baseline  frames  {pf} – {pf+bf-1}      ({bf} frames,  ~{bl:.0f} s)\n"
+                f"  stimulus  frames  {pf+bf} – {pf+bf+sf-1}   ({sf} frames,  ~{st:.0f} s)\n\n"
+                f"  Expected per session: {se} frames  ({pf} + {bf} + {sf})\n"
+                f"  Actual count read from recording — mismatch shown in run log."
             ))
 
     # ── tab 4: run ─────────────────────────────────────────────────────────
@@ -1045,7 +1051,7 @@ class PipelineGUI(ctk.CTk):
     def _pipeline_body(self, p: dict):
         from pipeline import (init, load_data, affine_motion_correction,
                                rigid_motion_correction, source_extraction,
-                               _get_provenance)
+                               _get_provenance, _save_provenance)
         from pipeline_funcs import get_stims1_stims2, get_resp1_resp2
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
@@ -1099,6 +1105,17 @@ class PipelineGUI(ctk.CTk):
 
             if self.do_analysis.get():
                 self._log("  Computing stimulus responses …")
+                for z in p["z_planes"]:
+                    mc_z = ((provenance.get('rigid_motion_correction') or {})
+                            .get(z) or {})
+                    counts = mc_z.get('session_frame_counts')
+                    if counts:
+                        expected = d['ses_f']
+                        status = "✓" if all(c == expected for c in counts) else "⚠ MISMATCH"
+                        self._log(
+                            f"    {z}: {counts[0]} + {counts[1]} frames recorded  "
+                            f"(timing params expect {expected} each)  {status}"
+                        )
                 stims1, stims2, z_ids = get_stims1_stims2(
                     provenance,
                     frame_period=fp,
@@ -1106,6 +1123,11 @@ class PipelineGUI(ctk.CTk):
                     baseline_s=base_s,
                     stim_s=stim_s,
                 )
+                provenance['analysis_params'] = dict(
+                    frame_period=fp, pre_discard_s=pre_s,
+                    baseline_s=base_s, stim_s=stim_s, threshold=threshold,
+                )
+                _save_provenance(provenance)
                 _all_stims1.append(stims1)
                 _all_stims2.append(stims2)
                 _z_ids.append(z_ids)
@@ -1142,7 +1164,7 @@ class PipelineGUI(ctk.CTk):
         self._log("Opening figures …")
         self.after(0, lambda: self._show_plots(
             resp1, resp2, nums, stim_onset_idx, d["ses_f"],
-            fp, pre_s, results_dir))
+            fp, pre_s, stim_s, results_dir))
         self._log("Done.")
 
     # ── save results ───────────────────────────────────────────────────────
@@ -1184,7 +1206,7 @@ class PipelineGUI(ctk.CTk):
 
     def _show_plots(self, resp1, resp2, nums,
                     stim_onset_idx: int, ses_f: int,
-                    fp: float, pre_s: float, results_dir: str):
+                    fp: float, pre_s: float, stim_s: float, results_dir: str):
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
 
@@ -1207,21 +1229,24 @@ class PipelineGUI(ctk.CTk):
         im = ax1.imshow(resp1, aspect="auto", vmin=0, vmax=8)
         ax2.imshow(resp2, aspect="auto", vmin=0, vmax=8)
 
-        pre_f = round(pre_s / fp)
+        stim_dur_f  = resp1.shape[1] - stim_onset_idx
+        analyzed_s  = round(stim_dur_f * fp)
         tick_frames = [0, stim_onset_idx, resp1.shape[1]]
         tick_labels = [
-            f"{round(pre_s)}",
-            f"{round((pre_f + stim_onset_idx) * fp)}",
-            f"{round((pre_f + resp1.shape[1]) * fp)}",
+            f"-{round(stim_onset_idx * fp)}",
+            "0",
+            f"+{analyzed_s}",
         ]
         for ax, title in ((ax1, "Stimulus 1"), (ax2, "Stimulus 2")):
             ax.axvline(stim_onset_idx, color="w", lw=0.8, ls="--")
             ax.set_title(title)
             ax.yaxis.set_visible(False)
-            ax.set_xlabel("Time (s from session start)")
+            ax.set_xlabel("Time (s, stim onset = 0)")
             ax.set_xticks(tick_frames, tick_labels)
         fig.colorbar(im, ax=[ax1, ax2], shrink=0.5, label="z-score")
-        fig.suptitle("Responder heatmap")
+        stim_note = (f"  ⚠ recording shorter than requested {round(stim_s)} s"
+                     if analyzed_s < round(stim_s) else "")
+        fig.suptitle(f"Responder heatmap  (stim = {analyzed_s} s){stim_note}")
         fig.savefig(Path(results_dir) / "heatmap.png", dpi=150, bbox_inches="tight")
 
         # bar chart
