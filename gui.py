@@ -1099,6 +1099,17 @@ class PipelineGUI(ctk.CTk):
 
             if self.do_analysis.get():
                 self._log("  Computing stimulus responses …")
+                for z in p["z_planes"]:
+                    mc_z = ((provenance.get('rigid_motion_correction') or {})
+                            .get(z) or {})
+                    counts = mc_z.get('session_frame_counts')
+                    if counts:
+                        expected = d['ses_f']
+                        status = "✓" if all(c == expected for c in counts) else "⚠ MISMATCH"
+                        self._log(
+                            f"    {z}: {counts[0]} + {counts[1]} frames recorded  "
+                            f"(timing params expect {expected} each)  {status}"
+                        )
                 stims1, stims2, z_ids = get_stims1_stims2(
                     provenance,
                     frame_period=fp,
@@ -1207,18 +1218,18 @@ class PipelineGUI(ctk.CTk):
         im = ax1.imshow(resp1, aspect="auto", vmin=0, vmax=8)
         ax2.imshow(resp2, aspect="auto", vmin=0, vmax=8)
 
-        pre_f = round(pre_s / fp)
+        stim_dur_f  = resp1.shape[1] - stim_onset_idx
         tick_frames = [0, stim_onset_idx, resp1.shape[1]]
         tick_labels = [
-            f"{round(pre_s)}",
-            f"{round((pre_f + stim_onset_idx) * fp)}",
-            f"{round((pre_f + resp1.shape[1]) * fp)}",
+            f"-{round(stim_onset_idx * fp)}",
+            "0",
+            f"+{round(stim_dur_f * fp)}",
         ]
         for ax, title in ((ax1, "Stimulus 1"), (ax2, "Stimulus 2")):
             ax.axvline(stim_onset_idx, color="w", lw=0.8, ls="--")
             ax.set_title(title)
             ax.yaxis.set_visible(False)
-            ax.set_xlabel("Time (s from session start)")
+            ax.set_xlabel("Time (s, stim onset = 0)")
             ax.set_xticks(tick_frames, tick_labels)
         fig.colorbar(im, ax=[ax1, ax2], shrink=0.5, label="z-score")
         fig.suptitle("Responder heatmap")

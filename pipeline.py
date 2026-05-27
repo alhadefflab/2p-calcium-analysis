@@ -382,6 +382,11 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 
     #mc_fname = affcorr_results_filenames[ch_dict['mc_ch']][i]
     #func_fname = affcorr_results_filenames[ch_dict['func_ch']][i]
+    session_frame_counts = [
+        affcorr_results[ch_dict['mc_ch']][i].shape[0]
+        for i in sorted(affcorr_results[ch_dict['mc_ch']].keys())
+    ]
+
     mc_fname = (output_dir / "concat_mc.tif").as_posix()
     mc_concat = np.concatenate( list(affcorr_results[ch_dict['mc_ch']].values()) )
     imsave(mc_fname, mc_concat)
@@ -420,6 +425,7 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
     provenance['rigid_motion_correction'][z]['args'] = args_dict
     provenance['rigid_motion_correction'][z]['filenames'] = rigcorr_results_filenames
     provenance['rigid_motion_correction'][z]['motion_correct_obj'] = mc_obj_file
+    provenance['rigid_motion_correction'][z]['session_frame_counts'] = session_frame_counts
 
     cm.stop_server(dview=dview)
 

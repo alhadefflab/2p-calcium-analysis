@@ -301,6 +301,43 @@ def why(provenance, cnm, center):
     out.release
 
 
+def _compute_session_windows(pre_f, base_f, stim_f, ses1_frames, ses2_frames):
+    """
+    Return frame-index windows for both sessions given actual per-session frame
+    counts.  stim_f caps the analysis window width; session boundaries are
+    derived solely from ses1_frames / ses2_frames, not from stim_f.
+    """
+    ses2_offset  = ses1_frames
+    bline1_start = pre_f
+    bline1_end   = pre_f + base_f
+    stim1_end    = min(bline1_end + stim_f, ses1_frames)
+    bline2_start = ses2_offset + pre_f
+    bline2_end   = bline2_start + base_f
+    stim2_end    = min(bline2_end + stim_f, ses2_offset + ses2_frames)
+    return bline1_start, bline1_end, stim1_end, bline2_start, bline2_end, stim2_end
+
+
+class _CnmfSlice:
+    """
+    A lightweight view of one session's CNMF estimates, starting at local frame 0.
+    Spatial components (A, b, dims) are shared; temporal arrays (C, f, YrA) are sliced.
+    Passing this to custom_df_f_startend lets each session be z-scored independently.
+    """
+    class _E:
+        pass
+
+    def __init__(self, cnm, start, end):
+        est = cnm.estimates
+        e = self._E()
+        e.A    = est.A
+        e.C    = est.C[:, start:end]
+        e.b    = est.b
+        e.f    = est.f[:, start:end]
+        e.YrA  = est.YrA[:, start:end]
+        e.dims = est.dims
+        self.estimates = e
+
+
 def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
     stims1 = []
     stims2 = []
@@ -319,35 +356,37 @@ def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline
         cnm = cnmf.load_CNMF(cnm_file)
         center = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
 
-
-        #why(provenance, cnm, center)
-
-        #
         pre_f  = round(pre_discard_s / frame_period)
         base_f = round(baseline_s    / frame_period)
         stim_f = round(stim_s        / frame_period)
-        ses_f  = pre_f + base_f + stim_f
 
-        bline1_start, bline1_end = pre_f,            pre_f + base_f
-        stim1_start,  stim1_end  = bline1_end,       ses_f
-        bline2_start, bline2_end = ses_f + pre_f,    ses_f + pre_f + base_f
-        stim2_start,  stim2_end  = bline2_end,       2 * ses_f
+        counts = provenance['rigid_motion_correction'][z].get('session_frame_counts')
+        if counts is not None:
+            ses1_f, ses2_f = counts[0], counts[1]
+        else:
+            ses1_f = ses2_f = T // 2
 
-        fl_acc1 = custom_df_f_startend(cnm, bline1_start, bline1_end, method='zscore', use_residuals=True)
-        fl_acc2 = custom_df_f_startend(cnm, bline2_start, bline2_end, method='zscore', use_residuals=True)
+        # Slice the CNMF traces into per-session views starting at local frame 0.
+        # This means both sessions use identical local window indices (no offset math).
+        cnm1 = _CnmfSlice(cnm, 0,      ses1_f)
+        cnm2 = _CnmfSlice(cnm, ses1_f, ses1_f + ses2_f)
 
-        stim1 = fl_acc1[:, bline1_start:stim1_end]  
-        stim2 = fl_acc2[:, bline2_start:stim2_end]
+        bline_start = pre_f
+        bline_end   = pre_f + base_f
 
-        #area_indices = select_subregions(img.copy(), cnm, ['Area 1']) 
-        #show_subregions(img, cnm, area_indices, ['red'])
-        #stim1area1 = stim1[area_indices[0], :]
+        fl_acc1 = custom_df_f_startend(cnm1, bline_start, bline_end, method='zscore', use_residuals=True)
+        fl_acc2 = custom_df_f_startend(cnm2, bline_start, bline_end, method='zscore', use_residuals=True)
+
+        stim1_end = min(bline_end + stim_f, ses1_f)
+        stim2_end = min(bline_end + stim_f, ses2_f)
+
+        stim1 = fl_acc1[:, bline_start:stim1_end]
+        stim2 = fl_acc2[:, bline_start:stim2_end]
 
         stims1.append(stim1)
         stims2.append(stim2)
 
-        z_ids.extend([int(z.replace('z', ''))]*stim1.shape[0])
-
+        z_ids.extend([int(z.replace('z', ''))] * stim1.shape[0])
 
     stims1 = np.vstack(stims1)
     stims2 = np.vstack(stims2)

@@ -7,7 +7,7 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 
-from pipeline_funcs import custom_df_f_startend, get_resp1_resp2
+from pipeline_funcs import custom_df_f_startend, get_resp1_resp2, _compute_session_windows
 
 
 # ── mock CNMF object ──────────────────────────────────────────────────────────
@@ -252,3 +252,55 @@ class TestGetResp1Resp2:
         assert len(z_ids_sel[0]) == nums[0]
         assert len(z_ids_sel[1]) == nums[1]
         assert len(z_ids_sel[2]) == nums[2]
+
+
+# ── _compute_session_windows ──────────────────────────────────────────────────
+
+class TestComputeSessionWindows:
+
+    def test_session2_boundary_independent_of_stim_s(self):
+        """Changing stim_s must not move where session 2 starts."""
+        pre_f = base_f = 51
+        ses_f = 410  # real 180 s recording (51+51+308)
+
+        _, _, _, bline2_start_180, _, _ = _compute_session_windows(
+            pre_f, base_f, 308, ses_f, ses_f)
+        _, _, _, bline2_start_240, _, _ = _compute_session_windows(
+            pre_f, base_f, 410, ses_f, ses_f)
+
+        assert bline2_start_180 == bline2_start_240, (
+            "Session 2 boundary must not shift when stim_s changes")
+
+    def test_stim_window_clipped_when_stim_s_exceeds_data(self):
+        """stim_f larger than available stim data is silently clipped."""
+        pre_f, base_f = 51, 51
+        ses_f = 410   # only 308 frames of stim available
+
+        _, _, stim1_end, _, _, stim2_end = _compute_session_windows(
+            pre_f, base_f, 9999, ses_f, ses_f)
+
+        assert stim1_end == ses_f,      "stim1_end must not exceed session 1"
+        assert stim2_end == 2 * ses_f,  "stim2_end must not exceed session 2"
+
+    def test_shorter_stim_s_analyzes_fewer_frames_when_data_is_long(self):
+        """With a long recording, a smaller stim_s analyses fewer stim frames."""
+        pre_f, base_f = 51, 51
+        ses_f = 512   # data long enough for 240 s stim
+
+        _, bline1_end, stim1_end_180, _, _, _ = _compute_session_windows(
+            pre_f, base_f, 308, ses_f, ses_f)
+        _, _, stim1_end_240, _, _, _ = _compute_session_windows(
+            pre_f, base_f, 410, ses_f, ses_f)
+
+        assert (stim1_end_180 - bline1_end) < (stim1_end_240 - bline1_end)
+
+    def test_asymmetric_sessions_handled_correctly(self):
+        """Sessions of different lengths (edge case) are still split correctly."""
+        pre_f, base_f, stim_f = 51, 51, 308
+        ses1_f, ses2_f = 410, 420   # session 2 slightly longer
+
+        b1s, b1e, s1e, b2s, b2e, s2e = _compute_session_windows(
+            pre_f, base_f, stim_f, ses1_f, ses2_f)
+
+        assert b2s == ses1_f + pre_f,   "session 2 baseline must start at ses1_f + pre_f"
+        assert s2e <= ses1_f + ses2_f,  "session 2 stim window must not overflow"
