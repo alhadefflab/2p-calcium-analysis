@@ -117,9 +117,10 @@ def _canvas_to_image(cx: float, cy: float,
 class ROIEditorWindow(ctk.CTkToplevel):
     """Integrated ROI curation: remove, add, and region-exclusion in one window."""
 
-    _REMOVE = "remove"
-    _ADD    = "add"
-    _REGION = "region"
+    _REMOVE    = "remove"
+    _ADD       = "add"
+    _REGION    = "region"
+    _SUBREGION = "subregion"
 
     _INSTRUCTIONS = {
         "remove": (
@@ -128,9 +129,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "Use Undo to restore the last change."
         ),
         "add": (
-            "LEFT-CLICK and DRAG to paint a new neuron.\n\n"
-            "Fill the entire soma — do not just trace the outline.\n\n"
-            "Release the mouse to confirm."
+            "LEFT-CLICK and DRAG to trace the outline of a neuron.\n\n"
+            "Release the mouse to confirm — the interior fills automatically."
         ),
         "region": (
             "LEFT-CLICK to place polygon vertices around the region to KEEP "
@@ -138,10 +138,18 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "RIGHT-CLICK to close the polygon.\n\n"
             "Neurons whose centres fall outside are removed."
         ),
+        "subregion": (
+            "Define two sub-regions for comparative analysis.\n\n"
+            "LEFT panel: structural (MC) channel — use it to orient anatomically.\n"
+            "RIGHT panel: functional channel + ROIs — draw your regions here.\n\n"
+            "LEFT-CLICK on the right panel to add vertices — REGION A (yellow).\n"
+            "RIGHT-CLICK to confirm Region A, then draw REGION B (cyan).\n"
+            "RIGHT-CLICK again to finalize Region B."
+        ),
     }
 
     def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish,
-                 display_settings=None):
+                 display_settings=None, mc_img_bkg=None):
         super().__init__(parent)
         self.title(f"ROI Curation — {z}")
         self.resizable(True, True)
@@ -152,6 +160,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._roi_masks = roi_masks.copy()
         self._roi_bkg   = roi_img_bkg.copy()
         self._roi_msk   = roi_img_mask.copy()
+        self._mc_bkg    = mc_img_bkg  # structural channel for sub-region orientation
 
         h, w = roi_img_bkg.shape[:2]
         self._ih, self._iw = h, w
@@ -170,6 +179,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._history   = []
         self._img_id    = None
         self._ref_id    = None
+
+        # sub-region state
+        self._sreg_polys      = [[], []]   # canvas-coord vertices per region
+        self._sreg_canvas_ids = [[], []]   # canvas item IDs per region
+        self._sreg_masks      = [None, None]  # bool arrays (h, w) per region
+        self._sreg_cur        = 0          # which region is being drawn (0=A, 1=B)
 
         ds = display_settings or {}
         self._gamma_var  = tk.DoubleVar(value=ds.get("gamma",   1.36))
@@ -196,8 +211,9 @@ class ROIEditorWindow(ctk.CTkToplevel):
         canvas_area.columnconfigure(0, weight=1)
         canvas_area.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(canvas_area, text="Reference  (no ROIs)",
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, pady=(4, 2))
+        self._lbl_ref = ctk.CTkLabel(canvas_area, text="Reference  (no ROIs)",
+                                     font=ctk.CTkFont(size=11))
+        self._lbl_ref.grid(row=0, column=0, pady=(4, 2))
         ctk.CTkLabel(canvas_area, text="ROIs  (interactive)",
                      font=ctk.CTkFont(size=11)).grid(row=0, column=1, pady=(4, 2))
 
@@ -220,9 +236,10 @@ class ROIEditorWindow(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(12, 6), padx=10)
 
         self._mode_btns = {}
-        for key, lbl in [(self._REMOVE, "Remove Neurons"),
-                          (self._ADD,    "Add Neuron"),
-                          (self._REGION, "Exclude Region")]:
+        for key, lbl in [(self._REMOVE,    "Remove Neurons"),
+                          (self._ADD,       "Add Neuron"),
+                          (self._REGION,    "Exclude Region"),
+                          (self._SUBREGION, "Define Sub-Regions")]:
             b = ctk.CTkButton(panel, text=lbl, width=190,
                                command=lambda k=key: self._set_mode(k))
             b.pack(pady=3, padx=10)
@@ -268,6 +285,10 @@ class ROIEditorWindow(ctk.CTkToplevel):
         ctk.CTkButton(panel, text="Finish ✓", width=190,
                        fg_color="#2d6a2d", hover_color="#1e4d1e",
                        command=self._do_finish).pack(side="bottom", padx=10, pady=4)
+        self._snap_btn = ctk.CTkButton(panel, text="Snap Boundaries", width=190,
+                                        state="disabled",
+                                        command=self._sreg_snap)
+        self._snap_btn.pack(side="bottom", padx=10, pady=4)
         ctk.CTkButton(panel, text="Undo", width=190,
                        command=self._undo).pack(side="bottom", padx=10, pady=4)
 
@@ -284,10 +305,26 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._poly_pts = []
         self._poly_ids = []
 
+        if mode == self._SUBREGION:
+            # clear any in-progress polygon drawing for the current region
+            for pid in self._sreg_canvas_ids[self._sreg_cur]:
+                self._canvas.delete(pid)
+            self._sreg_canvas_ids[self._sreg_cur] = []
+            self._sreg_polys[self._sreg_cur] = []
+            # keep _sreg_masks intact so confirmed regions survive mode switches
+            ref_lbl = ("Structural channel  (anatomy / MC)"
+                       if self._mc_bkg is not None else "Reference  (no ROIs)")
+        else:
+            ref_lbl = "Reference  (no ROIs)"
+
+        if hasattr(self, '_lbl_ref'):
+            self._lbl_ref.configure(text=ref_lbl)
+
         for k, btn in self._mode_btns.items():
             btn.configure(fg_color="#1a5276" if k == mode else ("#3b8ed0", "#1f6aa5"))
         self._instr.configure(text=self._INSTRUCTIONS.get(mode, ""))
         self._status.configure(text="")
+        self._refresh_canvas()
 
     # ── canvas ────────────────────────────────────────────────────────────────
 
@@ -321,20 +358,51 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
     def _refresh_canvas(self):
         from PIL import Image as PILImage, ImageTk
-        bkg_bright = self._bright_bkg()
+
+        # Interactive canvas always uses the functional channel so ROIs stay
+        # visually aligned with the background they were detected on.
+        func_bright = self._bright_bkg()
         dw, dh = self._dw, self._dh
 
-        # reference: bright background only
-        pil_ref = PILImage.fromarray(bkg_bright).resize((dw, dh), PILImage.BILINEAR)
+        # build region overlay (yellow=A, cyan=B) for sub-region mode
+        sreg_overlay = np.zeros((self._ih, self._iw, 3), dtype=np.int16)
+        if self._mode == self._SUBREGION:
+            colors = [(80, 80, 0), (0, 60, 80)]
+            for mask, col in zip(self._sreg_masks, colors):
+                if mask is not None:
+                    sreg_overlay[mask] = col
+
+        # ── reference canvas ──────────────────────────────────────────────────
+        # In sub-region mode show the structural (MC) channel so the user can
+        # orient anatomically.  Fall back to functional if MC is unavailable.
+        if self._mode == self._SUBREGION and self._mc_bkg is not None:
+            mc_f  = self._mc_bkg.astype(np.float32)
+            lo    = np.percentile(mc_f, self._lo_var.get())
+            hi    = np.percentile(mc_f, self._hi_var.get())
+            gamma = self._gamma_var.get()
+            if hi > lo:
+                mc_f = np.clip((mc_f - lo) / (hi - lo), 0, 1)
+            else:
+                mc_f = np.zeros_like(mc_f)
+            ref_bright = np.clip(np.power(mc_f, gamma) * 255, 0, 255).astype(np.uint8)
+        else:
+            ref_bright = func_bright
+
+        ref_base = np.clip(
+            ref_bright.astype(np.int16) + sreg_overlay, 0, 255
+        ).astype(np.uint8)
+        pil_ref = PILImage.fromarray(ref_base).resize((dw, dh), PILImage.BILINEAR)
         self._tk_ref = ImageTk.PhotoImage(pil_ref)
         if self._ref_id is None:
             self._ref_id = self._canvas_ref.create_image(0, 0, anchor="nw", image=self._tk_ref)
         else:
             self._canvas_ref.itemconfig(self._ref_id, image=self._tk_ref)
 
-        # interactive: bright background + ROI colour overlay
+        # ── interactive canvas ────────────────────────────────────────────────
+        # Always functional channel + ROI overlay so ROIs remain correctly placed.
         combined = np.clip(
-            bkg_bright.astype(np.int16) + self._roi_msk.astype(np.int16), 0, 255
+            func_bright.astype(np.int16) + self._roi_msk.astype(np.int16) + sreg_overlay,
+            0, 255
         ).astype(np.uint8)
         pil_roi = PILImage.fromarray(combined).resize((dw, dh), PILImage.BILINEAR)
         self._tk_img = ImageTk.PhotoImage(pil_roi)
@@ -372,6 +440,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._refresh_canvas()
         elif self._mode == self._REGION:
             self._close_polygon()
+        elif self._mode == self._SUBREGION:
+            self._sreg_close_region()
 
     # ── add ───────────────────────────────────────────────────────────────────
 
@@ -382,6 +452,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._paint(event.x, event.y)
         elif self._mode == self._REGION:
             self._add_poly_pt(event.x, event.y)
+        elif self._mode == self._SUBREGION and self._sreg_cur <= 1:
+            self._sreg_add_pt(event.x, event.y)
 
     def _on_left_mv(self, event):
         if self._mode == self._ADD and self._new_mask is not None:
@@ -389,7 +461,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
     def _paint(self, cx, cy):
         ix, iy = self._c2i(cx, cy)
-        br = 5
+        br = 2
         for dx in range(-br, br + 1):
             for dy in range(-br, br + 1):
                 px, py = ix + dx, iy + dy
@@ -410,6 +482,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "Add neuron", "Add this painted region as a new neuron?", parent=self)
         self._canvas.delete("paint")
         if confirmed:
+            from scipy.ndimage import binary_fill_holes
+            self._new_mask = binary_fill_holes(self._new_mask)
             self._push_history()
             flat_col = self._new_mask.flatten('F').reshape(-1, 1)
             self._roi_masks = np.concatenate([self._roi_masks, flat_col], axis=1)
@@ -482,6 +556,121 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._poly_ids = []
         self._poly_pts = []
 
+    # ── sub-region definition ─────────────────────────────────────────────────
+
+    def _sreg_add_pt(self, cx, cy):
+        ri = self._sreg_cur
+        col = "yellow" if ri == 0 else "cyan"
+        dot = self._canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                        fill=col, outline=col, tags="sreg")
+        self._sreg_canvas_ids[ri].append(dot)
+        if self._sreg_polys[ri]:
+            px, py = self._sreg_polys[ri][-1]
+            ln = self._canvas.create_line(px, py, cx, cy,
+                                           fill=col, width=2, tags="sreg")
+            self._sreg_canvas_ids[ri].append(ln)
+        self._sreg_polys[ri].append((cx, cy))
+        region_name = "Region A" if ri == 0 else "Region B"
+        self._status.configure(
+            text=f"{region_name}: {len(self._sreg_polys[ri])} point(s). Right-click to confirm.")
+
+    def _sreg_close_region(self):
+        ri = self._sreg_cur
+        pts = self._sreg_polys[ri]
+        if len(pts) < 3:
+            self._status.configure(text="Need at least 3 points first.")
+            return
+
+        col = "yellow" if ri == 0 else "cyan"
+        px, py = pts[-1]
+        fx, fy = pts[0]
+        close_ln = self._canvas.create_line(px, py, fx, fy,
+                                             fill=col, width=2, tags="sreg")
+        self._sreg_canvas_ids[ri].append(close_ln)
+
+        from PIL import Image as PILImage, ImageDraw
+        img_pts = [_canvas_to_image(cx, cy, self._scale_x, self._scale_y) for cx, cy in pts]
+        pmask = PILImage.new('L', (self._iw, self._ih), 0)
+        ImageDraw.Draw(pmask).polygon(img_pts, fill=255)
+        self._sreg_masks[ri] = np.array(pmask, dtype=bool)
+
+        self._sreg_cur += 1
+        if self._sreg_cur == 1:
+            self._status.configure(text="Region A confirmed. Now draw Region B (cyan).")
+        else:
+            self._status.configure(
+                text="Both regions defined. Use Snap Boundaries if edges are close, then Finish.")
+            if hasattr(self, '_snap_btn'):
+                self._snap_btn.configure(state="normal")
+        self._refresh_canvas()
+
+    def _sreg_snap(self, threshold_px: int = 20):
+        """Snap vertices of Region A and Region B that are within threshold_px of
+        each other to their exact midpoint, closing any tiny gap at the shared border.
+        Both region masks are recomputed after snapping."""
+        if self._sreg_cur < 2:
+            self._status.configure(text="Define both regions first.")
+            return
+
+        pts_a = list(self._sreg_polys[0])
+        pts_b = list(self._sreg_polys[1])
+
+        new_a = list(pts_a)
+        new_b = list(pts_b)
+        snapped = 0
+
+        for i, (ax, ay) in enumerate(pts_a):
+            for j, (bx, by) in enumerate(pts_b):
+                dist = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+                if dist <= threshold_px:
+                    mx = (ax + bx) / 2
+                    my = (ay + by) / 2
+                    new_a[i] = (mx, my)
+                    new_b[j] = (mx, my)
+                    snapped += 1
+
+        if snapped == 0:
+            self._status.configure(
+                text=f"No vertex pairs within {threshold_px} px — try moving vertices closer first.")
+            return
+
+        from PIL import Image as PILImage, ImageDraw
+
+        for ri, new_pts, col in [(0, new_a, "yellow"), (1, new_b, "cyan")]:
+            # Clear existing canvas items for this region
+            for pid in self._sreg_canvas_ids[ri]:
+                self._canvas.delete(pid)
+            self._sreg_canvas_ids[ri] = []
+            self._sreg_polys[ri] = new_pts
+
+            # Redraw polygon on the interactive canvas
+            for k, (cx, cy) in enumerate(new_pts):
+                dot = self._canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                                fill=col, outline=col, tags="sreg")
+                self._sreg_canvas_ids[ri].append(dot)
+                if k > 0:
+                    px, py = new_pts[k - 1]
+                    ln = self._canvas.create_line(px, py, cx, cy,
+                                                   fill=col, width=2, tags="sreg")
+                    self._sreg_canvas_ids[ri].append(ln)
+            if len(new_pts) >= 2:
+                px, py = new_pts[-1]
+                fx, fy = new_pts[0]
+                close_ln = self._canvas.create_line(px, py, fx, fy,
+                                                     fill=col, width=2, tags="sreg")
+                self._sreg_canvas_ids[ri].append(close_ln)
+
+            # Recompute mask from updated polygon
+            img_pts = [_canvas_to_image(cx, cy, self._scale_x, self._scale_y)
+                       for cx, cy in new_pts]
+            pmask = PILImage.new('L', (self._iw, self._ih), 0)
+            ImageDraw.Draw(pmask).polygon(img_pts, fill=255)
+            self._sreg_masks[ri] = np.array(pmask, dtype=bool)
+
+        self._status.configure(
+            text=f"Snapped {snapped} vertex pair(s). Masks updated.")
+        self._refresh_canvas()
+
     # ── undo / finish ─────────────────────────────────────────────────────────
 
     def _push_history(self):
@@ -490,12 +679,47 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._history.pop(0)
 
     def _undo(self):
+        if self._mode == self._SUBREGION:
+            self._sreg_undo()
+            return
         if not self._history:
             self._status.configure(text="Nothing to undo.")
             return
         self._roi_masks, self._roi_msk = self._history.pop()
         self._status.configure(text=f"Undone. Total: {self._roi_masks.shape[1]}")
         self._refresh_canvas()
+
+    def _sreg_undo(self):
+        ri = self._sreg_cur  # 0, 1, or 2
+
+        # If actively drawing (ri < 2) and there are in-progress vertices, clear them.
+        # NOTE: _sreg_polys only has indices 0 and 1, so guard with ri < 2 before indexing.
+        if ri < 2 and self._sreg_polys[ri]:
+            for pid in self._sreg_canvas_ids[ri]:
+                self._canvas.delete(pid)
+            self._sreg_canvas_ids[ri] = []
+            self._sreg_polys[ri] = []
+            self._status.configure(
+                text=f"{'Region A' if ri == 0 else 'Region B'} drawing cleared.")
+            return
+
+        # Step back one confirmed region (works for ri == 1 or ri == 2)
+        if ri > 0:
+            prev = ri - 1          # the last-confirmed region index
+            self._sreg_cur = prev
+            self._sreg_masks[prev] = None
+            for pid in self._sreg_canvas_ids[prev]:
+                self._canvas.delete(pid)
+            self._sreg_canvas_ids[prev] = []
+            self._sreg_polys[prev] = []
+            if hasattr(self, '_snap_btn'):
+                self._snap_btn.configure(state="disabled")
+            self._status.configure(
+                text=f"{'Region A' if prev == 0 else 'Region B'} removed — redraw it.")
+            self._refresh_canvas()
+            return
+
+        self._status.configure(text="Nothing to undo.")
 
     def _do_finish(self):
         clean = self._roi_masks[:, ~(self._roi_masks.sum(axis=0) == 0)]
@@ -504,7 +728,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "lo_pct": round(self._lo_var.get(),    3),
             "hi_pct": round(self._hi_var.get(),    3),
         }
-        self._on_finish(clean, self._roi_bkg, self._roi_msk, settings)
+        sreg = self._sreg_masks if any(m is not None for m in self._sreg_masks) else None
+        self._on_finish(clean, self._roi_bkg, self._roi_msk, settings, sreg)
         self.destroy()
 
 
@@ -892,11 +1117,21 @@ class PipelineGUI(ctk.CTk):
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
+        self.do_subregion_setup = ctk.CTkCheckBox(
+            stages,
+            text="Sub-region setup  —  (re)define sub-regions without re-running CNMF")
+        self.do_subregion_setup.pack(anchor="w", padx=16, pady=4)
+
         self.do_analysis = ctk.CTkCheckBox(
             stages,
             text="Stimulus response analysis  —  fast, re-run this after changing timing or threshold")
-        self.do_analysis.pack(anchor="w", padx=16, pady=(4, 10))
+        self.do_analysis.pack(anchor="w", padx=16, pady=4)
         self.do_analysis.select()
+
+        self.do_subregion = ctk.CTkCheckBox(
+            stages,
+            text="Sub-region analysis  —  optional, requires regions defined in the ROI editor")
+        self.do_subregion.pack(anchor="w", padx=16, pady=(4, 10))
 
         ctk.CTkLabel(tab,
                      text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.\n"
@@ -999,20 +1234,50 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._display_settings = {}
 
+        # Pre-compute structural (MC) channel mean frame for anatomical orientation.
+        # Use cm.load() — the same API used by _identify_rois for the functional
+        # channel — so both images come from the same CaImAn code path.
+        mc_img_bkg = None
+        try:
+            import caiman as cm
+            import cv2 as cv
+            from PIL import Image as _PILImg
+            mc_movie = cm.load(mc_corr_file)        # shape (T, d1, d2)
+            mc_mean  = np.mean(mc_movie, axis=0)    # (d1, d2)
+            scale    = mc_mean.max()
+            if scale > 0:
+                mc_gray = (mc_mean * 190 / scale).astype(np.uint8)
+                func_h, func_w = roi_img_bkg.shape[:2]
+                mc_h, mc_w = mc_gray.shape
+                if (mc_h, mc_w) != (func_h, func_w):
+                    self._log(
+                        f"  MC channel dims {(mc_h, mc_w)} differ from functional "
+                        f"{(func_h, func_w)} — resizing MC background to match.")
+                    mc_gray = np.array(
+                        _PILImg.fromarray(mc_gray).resize(
+                            (func_w, func_h), _PILImg.BILINEAR))
+                else:
+                    self._log(
+                        f"  MC background dims match functional ({func_h}×{func_w}) — no resize needed.")
+                mc_img_bkg = cv.cvtColor(mc_gray, cv.COLOR_GRAY2RGB)
+        except Exception as _e:
+            self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
+
         result_holder = [None]
         done = threading.Event()
 
         def _show():
-            def _on_finish(masks, bkg, mask_img, settings):
-                result_holder[0] = (masks, bkg, mask_img, settings)
+            def _on_finish(masks, bkg, mask_img, settings, sreg_masks=None):
+                result_holder[0] = (masks, bkg, mask_img, settings, sreg_masks)
                 done.set()
             ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
-                            _on_finish, display_settings=self._display_settings)
+                            _on_finish, display_settings=self._display_settings,
+                            mc_img_bkg=mc_img_bkg)
 
         self.after(0, _show)
         done.wait()
 
-        new_masks, new_bkg, new_mask_img, settings = result_holder[0]
+        new_masks, new_bkg, new_mask_img, settings, sreg_masks = result_holder[0]
 
         # Persist settings for next z-plane and save to project folder
         self._display_settings = settings
@@ -1021,6 +1286,13 @@ class PipelineGUI(ctk.CTk):
 
         roi_masks_file = Path(output_dir) / 'concat_roi-masks.npy'
         np.save(roi_masks_file, new_masks)
+
+        if sreg_masks and any(m is not None for m in sreg_masks):
+            h, w = roi_img_bkg.shape[:2]
+            fill = np.zeros((h, w), dtype=bool)
+            sreg_arr = np.stack([m if m is not None else fill for m in sreg_masks])
+            np.save(Path(output_dir) / f'subregion_masks_{z}.npy', sreg_arr)
+
         return new_masks, roi_masks_file, new_bkg, new_mask_img
 
     def _run_pipeline(self, p: dict):
@@ -1052,7 +1324,7 @@ class PipelineGUI(ctk.CTk):
         from pipeline import (init, load_data, affine_motion_correction,
                                rigid_motion_correction, source_extraction,
                                _get_provenance, _save_provenance)
-        from pipeline_funcs import get_stims1_stims2, get_resp1_resp2
+        from pipeline_funcs import get_stims1_stims2, get_resp1_resp2, get_region_labels
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
                                       p["baseline_s"],   p["stim_s"])
@@ -1067,7 +1339,7 @@ class PipelineGUI(ctk.CTk):
             f"({2 * d['ses_f']} total)"
         )
 
-        _all_stims1, _all_stims2, _z_ids = [], [], []
+        _all_stims1, _all_stims2, _z_ids, _all_region_labels = [], [], [], []
 
         for i, (sess1, sess2) in enumerate(p["animals"]):
             label = (f"{p['subject']}_animal{i + 1}"
@@ -1103,6 +1375,58 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._log("  Skipping CNMF — using saved results.")
 
+            if self.do_subregion_setup.get():
+                self._log("  Sub-region setup — ROI editor will open for sub-region definition …")
+                try:
+                    import caiman as cm
+                    import cv2 as _cv2
+                    ch_dict = provenance['load_data']['args']['ch_dict']
+                    for z in p["z_planes"]:
+                        se = (provenance.get('source_extraction') or {}).get(z)
+                        if not se:
+                            self._log(f"  ⚠ No CNMF results found for {z} — run CNMF first.")
+                            continue
+                        roi_masks_file = se['filenames']['roi_masks_file']
+                        if not Path(roi_masks_file).is_absolute():
+                            roi_masks_file = str(Path(out_dir) / Path(roi_masks_file).name)
+                        if not Path(roi_masks_file).exists():
+                            # try inside z sub-folder
+                            candidate = str(Path(out_dir) / z / Path(roi_masks_file).name)
+                            if Path(candidate).exists():
+                                roi_masks_file = candidate
+                        if not Path(roi_masks_file).exists():
+                            self._log(f"  ⚠ ROI masks file not found: {roi_masks_file}")
+                            continue
+                        roi_masks = np.load(roi_masks_file)
+
+                        func_corr_file = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['func_ch']]
+                        mc_corr_file   = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['mc_ch']]
+                        if not Path(func_corr_file).is_absolute():
+                            func_corr_file = str(Path(out_dir) / z / Path(func_corr_file).name)
+                        if not Path(mc_corr_file).is_absolute():
+                            mc_corr_file = str(Path(out_dir) / z / Path(mc_corr_file).name)
+
+                        func_movie = cm.load(func_corr_file)
+                        func_lc = np.array(func_movie).max(axis=0)
+                        scale = func_lc.max()
+                        if scale > 0:
+                            roi_img_bkg = (func_lc * 190 / scale).astype(np.uint8)
+                        else:
+                            roi_img_bkg = np.zeros(func_lc.shape, dtype=np.uint8)
+                        roi_img_bkg = _cv2.cvtColor(roi_img_bkg, _cv2.COLOR_GRAY2RGB)
+
+                        roi_img_mask = np.zeros([*func_lc.shape, 3], dtype=np.uint8)
+                        for mask_col in roi_masks.T:
+                            roi_img_mask[mask_col.reshape(func_lc.shape, order='F')] = (
+                                np.tile(65 * np.random.rand(1, 3), (int(mask_col.sum()), 1)).astype(int))
+
+                        self._roi_editor_for_pipeline(
+                            Path(out_dir) / z, mc_corr_file, z,
+                            roi_masks, roi_img_bkg, roi_img_mask)
+                except Exception:
+                    self._log("  ⚠ Sub-region setup failed:")
+                    self._log(traceback.format_exc())
+
             if self.do_analysis.get():
                 self._log("  Computing stimulus responses …")
                 for z in p["z_planes"]:
@@ -1131,6 +1455,42 @@ class PipelineGUI(ctk.CTk):
                 _all_stims1.append(stims1)
                 _all_stims2.append(stims2)
                 _z_ids.append(z_ids)
+
+                if self.do_subregion.get():
+                    self._log("  Classifying neurons by sub-region …")
+                    # Check whether any subregion mask files exist for this animal.
+                    # Files are stored in the per-z subfolder alongside other CNMF outputs.
+                    found_any = any(
+                        (Path(out_dir) / z / f'subregion_masks_{z}.npy').exists()
+                        for z in p["z_planes"]
+                    )
+                    if not found_any:
+                        self._log(
+                            "  ⚠ No subregion_masks_*.npy files found — expected at:\n"
+                            + "\n".join(
+                                f"      {Path(out_dir) / z / f'subregion_masks_{z}.npy'}"
+                                for z in p["z_planes"])
+                            + "\n    Run 'Sub-region setup' (or CNMF) and define both regions\n"
+                              "    in the ROI editor, then re-run analysis."
+                        )
+                        _all_region_labels.append(np.full(stims1.shape[0], -1, dtype=int))
+                    else:
+                        rlabels = get_region_labels(provenance, out_dir)
+                        _all_region_labels.append(rlabels)
+                        n_a = int((rlabels == 0).sum())
+                        n_b = int((rlabels == 1).sum())
+                        n_none = int((rlabels == -1).sum())
+                        self._log(
+                            f"    Region A: {n_a}   Region B: {n_b}   "
+                            f"Unclassified: {n_none}"
+                        )
+                        if n_a == 0 and n_b == 0:
+                            self._log(
+                                "  ⚠ All neurons are unclassified — check that the\n"
+                                "    sub-region polygons cover the neurons on the canvas."
+                            )
+                else:
+                    _all_region_labels.append(np.full(stims1.shape[0], -1, dtype=int))
 
         if not (self.do_analysis.get() and _all_stims1):
             self._log("\nDone.")
@@ -1165,6 +1525,39 @@ class PipelineGUI(ctk.CTk):
         self.after(0, lambda: self._show_plots(
             resp1, resp2, nums, stim_onset_idx, d["ses_f"],
             fp, pre_s, stim_s, results_dir))
+
+        # optional sub-region analysis
+        if self.do_subregion.get() and _all_region_labels:
+            region_labels_all = np.concatenate(_all_region_labels)
+            region_results = {}
+            for reg_idx, reg_name in [(0, "Region A"), (1, "Region B")]:
+                mask = region_labels_all == reg_idx
+                n_total_r = int(mask.sum())
+                if n_total_r == 0:
+                    continue
+                r1_r, r2_r, nums_r, _ = get_resp1_resp2(
+                    all_stims1[mask], all_stims2[mask],
+                    z_ids_all[mask],
+                    stim_onset_idx=stim_onset_idx,
+                    threshold=threshold,
+                )
+                region_results[reg_name] = {
+                    'resp1': r1_r, 'resp2': r2_r,
+                    'nums': nums_r, 'n_total': n_total_r,
+                }
+                self._log(
+                    f"{reg_name} — total: {n_total_r}  "
+                    f"stim1-only: {nums_r[0]}  both: {nums_r[1]}  stim2-only: {nums_r[2]}"
+                )
+            if region_results:
+                self._log(
+                    f"  Opening sub-region figures for: {', '.join(region_results.keys())}")
+                self.after(0, lambda rr=region_results: self._show_region_plots(
+                    rr, stim_onset_idx, d["ses_f"], fp, pre_s, stim_s, results_dir))
+            else:
+                self._log(
+                    "  ⚠ Sub-region plots skipped — no neurons were classified into any region.")
+
         self._log("Done.")
 
     # ── save results ───────────────────────────────────────────────────────
@@ -1258,6 +1651,76 @@ class PipelineGUI(ctk.CTk):
         ax.spines[["top", "right"]].set_visible(False)
         fig2.tight_layout()
         fig2.savefig(Path(results_dir) / "breakdown.png", dpi=150, bbox_inches="tight")
+
+        plt.show()
+
+    def _show_region_plots(self, region_results: dict,
+                           stim_onset_idx: int, ses_f: int,
+                           fp: float, pre_s: float, stim_s: float,
+                           results_dir: str):
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+
+        regions    = list(region_results.keys())   # e.g. ["Region A", "Region B"]
+        n_regions  = len(regions)
+        bar_colors = ["#4fa1ca", "#bb70b6", "#110979"]
+        reg_colors = ["#e6c84a", "#4ac0e6"]        # yellow, cyan — match canvas overlays
+
+        # ── figure 1: neuron count bar chart ──────────────────────────────────
+        fig, axes = plt.subplots(1, n_regions, figsize=(4 * n_regions, 4),
+                                 sharey=False, squeeze=False)
+        for col, (reg_name, rr) in enumerate(region_results.items()):
+            ax = axes[0, col]
+            nums_r   = rr['nums']          # [stim1-only, both, stim2-only]
+            n_total  = rr['n_total']
+            n_resp1  = nums_r[0] + nums_r[1]   # total responsive to stim1
+            n_resp2  = nums_r[1] + nums_r[2]   # total responsive to stim2
+
+            labels = ["Stim 1\nonly", "Both", "Stim 2\nonly"]
+            ax.bar(labels, nums_r, color=bar_colors)
+            ax.set_title(reg_name, color=reg_colors[col % 2],
+                         fontweight="bold", fontsize=12)
+            ax.set_ylabel("Neuron count")
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.text(0.5, 1.12,
+                    f"Total: {n_total}   |   Stim1 resp: {n_resp1}   Stim2 resp: {n_resp2}",
+                    ha="center", transform=ax.transAxes,
+                    fontsize=8, color="gray")
+
+        fig.suptitle("Sub-region neuron breakdown", fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(Path(results_dir) / "region_breakdown.png", dpi=150, bbox_inches="tight")
+
+        # ── figure 2: mean ± std z-score time traces ───────────────────────────
+        tick_frames = [0, stim_onset_idx]
+        tick_labels = [f"-{round(stim_onset_idx * fp)}", "0"]
+
+        fig2 = plt.figure(figsize=(7 * n_regions, 7), constrained_layout=True)
+        outer = gridspec.GridSpec(1, n_regions, figure=fig2, hspace=0.05)
+
+        for col, (reg_name, rr) in enumerate(region_results.items()):
+            inner = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[col],
+                                                     hspace=0.4)
+            for row, (stim_label, resp) in enumerate([
+                    ("Stimulus 1", rr['resp1']), ("Stimulus 2", rr['resp2'])]):
+                ax = fig2.add_subplot(inner[row])
+                if resp.shape[0] > 0:
+                    mean = resp.mean(axis=0)
+                    std  = resp.std(axis=0)
+                    x    = np.arange(resp.shape[1])
+                    ax.plot(x, mean, color=reg_colors[col % 2], lw=1.5)
+                    ax.fill_between(x, mean - std, mean + std,
+                                    color=reg_colors[col % 2], alpha=0.25)
+                ax.axvline(stim_onset_idx, color="gray", lw=0.8, ls="--")
+                ax.axhline(0, color="gray", lw=0.5, ls=":")
+                ax.set_title(f"{reg_name} — {stim_label}", fontsize=9)
+                ax.set_ylabel("z-score")
+                ax.set_xlabel("Time (s, stim onset = 0)")
+                ax.set_xticks(tick_frames, tick_labels)
+                ax.spines[["top", "right"]].set_visible(False)
+
+        fig2.suptitle("Sub-region mean z-score responses", fontweight="bold")
+        fig2.savefig(Path(results_dir) / "region_traces.png", dpi=150, bbox_inches="tight")
 
         plt.show()
 

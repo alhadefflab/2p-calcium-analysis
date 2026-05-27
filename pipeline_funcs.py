@@ -437,4 +437,40 @@ def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
 
     z_ids_sel = [z_ids[r_stim1only], z_ids[r_stim12], z_ids[r_stim2only]]
 
-    return resp1, resp2, nums, z_ids_sel    
+    return resp1, resp2, nums, z_ids_sel
+
+
+def get_region_labels(provenance, subregion_dir):
+    """
+    Return int array (N_neurons,) with neuron-to-region assignments:
+      0 = Region A, 1 = Region B, -1 = unclassified / no sub-region file.
+    Neuron ordering matches get_stims1_stims2 output for the same provenance.
+    """
+    from caiman.source_extraction.cnmf import cnmf as cnmf_module
+    from caiman.base.rois import com
+    from pathlib import Path
+
+    labels_all = []
+    for z in provenance['source_extraction'].keys():
+        cnm_file = provenance['source_extraction'][z]['filenames']['cnm_file']
+        cnm = cnmf_module.load_CNMF(cnm_file)
+        K = cnm.estimates.A.shape[1]
+
+        sreg_file = Path(subregion_dir) / z / f'subregion_masks_{z}.npy'
+        if sreg_file.exists():
+            sreg = np.load(sreg_file)           # shape (2, h, w)
+            centers = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
+            h, w = sreg.shape[1], sreg.shape[2]
+            lbl = np.full(K, -1, dtype=int)
+            for k, (cy, cx) in enumerate(centers):
+                r = min(max(int(round(cy)), 0), h - 1)
+                c = min(max(int(round(cx)), 0), w - 1)
+                if sreg[0, r, c]:
+                    lbl[k] = 0
+                elif sreg[1, r, c]:
+                    lbl[k] = 1
+            labels_all.append(lbl)
+        else:
+            labels_all.append(np.full(K, -1, dtype=int))
+
+    return np.concatenate(labels_all)
