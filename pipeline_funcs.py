@@ -474,3 +474,61 @@ def get_region_labels(provenance, subregion_dir):
             labels_all.append(np.full(K, -1, dtype=int))
 
     return np.concatenate(labels_all)
+
+
+def get_spatial_response_data(provenance, frame_period=0.585, pre_discard_s=30,
+                              baseline_s=30, stim_s=360, subregion_dir=None):
+    """Return per-z-plane data for spatial response map figures.
+
+    For each z-plane: anatomy image (MC channel max projection), neuron
+    centers of mass (row, col), per-neuron median z-scores over the stim
+    window for stim1 and stim2, and optionally subregion masks.
+
+    Returns a list of dicts with keys:
+        z               – z-plane label (e.g. 'z1')
+        anatomy         – 2-D float array (h, w), MC-channel max projection
+        centers         – (K, 2) float array, center-of-mass (row, col)
+        stim1_mdn       – (K,) float array, median z-score during stim1 window
+        stim2_mdn       – (K,) float array, median z-score during stim2 window
+        subregion_masks – (2, h, w) bool array or None if not defined
+    """
+    from caiman.source_extraction.cnmf import cnmf as cnmf_module
+    from caiman.base.rois import com
+    from pathlib import Path as _Path
+
+    ch_dict = provenance['load_data']['args']['ch_dict']
+    zs = provenance['source_extraction'].keys()
+    result = []
+
+    for z in zs:
+        cnm_file = provenance['source_extraction'][z]['filenames']['cnm_file']
+        mc_imgs_path = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['mc_ch']]
+
+        cnm = cnmf_module.load_CNMF(cnm_file)
+        centers = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
+
+        Yr_mc, dims_mc, T_mc = caiman.load_memmap(mc_imgs_path)
+        anatomy = np.reshape(Yr_mc.T, [T_mc] + list(dims_mc), order='F').max(axis=0)
+
+        pre_f  = round(pre_discard_s / frame_period)
+        base_f = round(baseline_s    / frame_period)
+        stim_f = round(stim_s        / frame_period)
+        ses1_len = _session_lengths(provenance, z)[0]
+        w = _session_window_indices(ses1_len, pre_f, base_f, stim_f)
+
+        fl1 = custom_df_f_startend(cnm, w['bline1_start'], w['bline1_end'], method='zscore', use_residuals=True)
+        fl2 = custom_df_f_startend(cnm, w['bline2_start'], w['bline2_end'], method='zscore', use_residuals=True)
+
+        stim1_mdn = np.median(fl1[:, w['stim1_start']:w['stim1_end']], axis=1)
+        stim2_mdn = np.median(fl2[:, w['stim2_start']:w['stim2_end']], axis=1)
+
+        sreg = None
+        if subregion_dir is not None:
+            sreg_file = _Path(subregion_dir) / z / f'subregion_masks_{z}.npy'
+            if sreg_file.exists():
+                sreg = np.load(sreg_file)
+
+        result.append(dict(z=z, anatomy=anatomy, centers=centers,
+                           stim1_mdn=stim1_mdn, stim2_mdn=stim2_mdn,
+                           subregion_masks=sreg))
+    return result

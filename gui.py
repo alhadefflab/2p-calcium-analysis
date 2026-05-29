@@ -1324,7 +1324,8 @@ class PipelineGUI(ctk.CTk):
         from pipeline import (init, load_data, affine_motion_correction,
                                rigid_motion_correction, source_extraction,
                                _get_provenance, _save_provenance)
-        from pipeline_funcs import get_stims1_stims2, get_resp1_resp2, get_region_labels
+        from pipeline_funcs import (get_stims1_stims2, get_resp1_resp2,
+                                    get_region_labels, get_spatial_response_data)
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
                                       p["baseline_s"],   p["stim_s"])
@@ -1340,6 +1341,7 @@ class PipelineGUI(ctk.CTk):
         )
 
         _all_stims1, _all_stims2, _z_ids, _all_region_labels = [], [], [], []
+        _all_spatial = []   # list of (label, spatial_data) for spatial response maps
 
         for i, (sess1, sess2) in enumerate(p["animals"]):
             label = (f"{p['subject']}_animal{i + 1}"
@@ -1455,6 +1457,10 @@ class PipelineGUI(ctk.CTk):
                 _all_stims1.append(stims1)
                 _all_stims2.append(stims2)
                 _z_ids.append(z_ids)
+                self._log("  Building spatial response data …")
+                _all_spatial.append((label, get_spatial_response_data(
+                    provenance, fp, pre_s, base_s, stim_s,
+                    subregion_dir=out_dir)))
 
                 if self.do_subregion.get():
                     self._log("  Classifying neurons by sub-region …")
@@ -1525,6 +1531,10 @@ class PipelineGUI(ctk.CTk):
         self.after(0, lambda: self._show_plots(
             resp1, resp2, nums, stim_onset_idx, d["ses_f"],
             fp, pre_s, stim_s, results_dir))
+
+        for _lbl, _sd in _all_spatial:
+            self.after(0, lambda lbl=_lbl, sd=_sd: self._show_spatial_response_map(
+                lbl, sd, threshold, results_dir))
 
         # optional sub-region analysis
         if self.do_subregion.get() and _all_region_labels:
@@ -1723,6 +1733,61 @@ class PipelineGUI(ctk.CTk):
         fig2.savefig(Path(results_dir) / "region_traces.png", dpi=150, bbox_inches="tight")
 
         plt.show()
+
+    def _show_spatial_response_map(self, label: str, spatial_data: list,
+                                   threshold: float, results_dir: str):
+        import matplotlib.pyplot as plt
+        from scipy.ndimage import gaussian_filter1d
+        from skimage.measure import find_contours
+
+        reg_colors = ["#e6c84a", "#4ac0e6"]   # yellow / cyan — match canvas overlays
+
+        for d in spatial_data:
+            z         = d['z']
+            anatomy   = d['anatomy']
+            centers   = d['centers']
+            stim1_mdn = d['stim1_mdn']
+            stim2_mdn = d['stim2_mdn']
+            sreg      = d.get('subregion_masks')   # (2, h, w) or None
+
+            stim_idx = stim2_mdn - stim1_mdn
+            stim_idx[np.maximum(stim1_mdn, stim2_mdn) < threshold] = np.nan
+
+            p_lo = np.percentile(anatomy, 0.5)
+            p_hi = np.percentile(anatomy, 99.5)
+            anat_disp = np.clip((anatomy - p_lo) / max(p_hi - p_lo, 1e-9), 0, 1)
+
+            fig, ax = plt.subplots(figsize=(7, 7))
+            ax.imshow(anat_disp, cmap='gray', origin='upper')
+            scat = ax.scatter(centers[:, 1], centers[:, 0],
+                              c=stim_idx, cmap='bwr', vmin=-10, vmax=10,
+                              s=120, edgecolors='none', alpha=0.9)
+
+            # smoothed sub-region contours
+            if sreg is not None:
+                sigma = max(8, min(anatomy.shape) // 30)
+                for reg_i, color in enumerate(reg_colors):
+                    if reg_i != 0:
+                        continue
+                    if reg_i >= sreg.shape[0]:
+                        break
+                    ctrs = find_contours(sreg[reg_i].astype(float), 0.5)
+                    if not ctrs:
+                        continue
+                    c = max(ctrs, key=len)   # longest contour = outer boundary
+                    sr = gaussian_filter1d(c[:, 0], sigma=sigma, mode='wrap')
+                    sc = gaussian_filter1d(c[:, 1], sigma=sigma, mode='wrap')
+                    ax.plot(np.append(sc, sc[0]), np.append(sr, sr[0]),
+                            color=color, lw=2.5, ls='--', alpha=0.9)
+
+            fig.colorbar(scat, ax=ax, shrink=0.7,
+                         label='Stim 2 − Stim 1 (median z-score)')
+            ax.set_title(f'{label}  —  {z}', fontsize=12, fontweight='bold')
+            ax.axis('off')
+            fig.tight_layout()
+            fname = Path(results_dir) / f'spatial_response_map_{label}_{z}.png'
+            fig.savefig(fname, dpi=150, bbox_inches='tight')
+            plt.show()
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

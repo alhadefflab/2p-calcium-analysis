@@ -395,7 +395,7 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 
     border_to_0 = 0 if mc.border_nan == 'copy' else mc.border_to_0 
 
-    mc_ch_basename = f'concat_{ch_dict["mc_ch"]}-rigcorr_struct-'
+    mc_ch_basename = (output_dir / f'concat_{ch_dict["mc_ch"]}_{z}-rigcorr_struct-').as_posix()
     rigcorr_results_filenames[ch_dict['mc_ch']] = cm.save_memmap(mc.mmap_file, base_name=mc_ch_basename, order='C',
                             border_to_0=border_to_0, dview=dview)
 
@@ -404,7 +404,7 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
     # func_fname = output_dir / f'concat_{ch_dict["func_ch"]}-affcorr_results.ome.tif'
     # imsave(func_fname, concat_fc)
 
-    f_ch_basename = (output_dir / f'concat_{ch_dict["func_ch"]}-rigcorr_func-').as_posix()
+    f_ch_basename = (output_dir / f'concat_{ch_dict["func_ch"]}_{z}-rigcorr_func-').as_posix()
     rigcorr_results_filenames[ch_dict['func_ch']] = mc.apply_shifts_movie(func_fname, 
                                                                     save_memmap=True, order = 'C', save_base_name=f_ch_basename)
 
