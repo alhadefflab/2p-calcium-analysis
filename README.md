@@ -22,36 +22,86 @@ Provenance is tracked automatically in a `provenance.yaml` file so each processi
 ## File Structure
 
 ```
-gui.py               # GUI entry point (NEW — start here)
+gui.py               # GUI entry point (start here)
 pipeline.py          # Core pipeline steps (load, motion correct, source extract)
 pipeline_funcs.py    # Post-extraction analysis (stimulus alignment, response calculation)
 pipeline_utils.py    # Utilities (TIFF combining, YAML provenance, argument capture)
-params.py            # All tunable parameters (MC, CNMF, video, ROI settings)
-analysis_again.py    # Legacy run script; kept for reference, superseded by gui.py
-scratch.py           # Exploratory / scratch code
+params.py            # All tunable parameters (MC, CNMF, video, ROI settings) + USE_GPU flag
 visualizationKB.py   # Visualization functions (Bokeh interactive + matplotlib)
-environment.yml      # Conda environment specification
+environment-cpu.yml  # Conda environment — CPU-only (no GPU required)
+environment-gpu.yml  # Conda environment — CUDA GPU acceleration
 ```
 
 ## Setup
 
-```bash
-conda env create -f environment.yml
-conda activate <env-name>
+Choose the environment that matches your hardware (Anaconda Prompt):
+
+---
+
+### CPU (no GPU)
+
+```
+conda env create -f environment-cpu.yml
+conda activate caiman-cpu
 ```
 
-**Key dependencies:** CaImAn, Cellpose, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy, matplotlib
+---
+
+### GPU (CUDA)
+
+**Step 1 — Install CUDA Toolkit 12.4 (once, system-wide)**
+
+Download the Windows installer from NVIDIA:
+https://developer.nvidia.com/cuda-12-4-0-download-archive
+
+Select: Windows → x86_64 → 11 → exe (local). Run the installer and reboot when prompted.
+
+Verify the install:
+```
+nvcc --version
+```
+
+**Step 2 — Create the conda environment**
+
+```
+conda env create -f environment-gpu.yml
+conda activate caiman-gpu
+```
+
+**Step 3 — Install GPU-enabled PyTorch**
+
+Conda installs a CPU-only torch as a CaImAn dependency. Replace it with the CUDA build:
+
+```
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall
+```
+
+**Step 4 — Verify**
+
+```
+python -c "import torch; print(torch.cuda.is_available())"
+python -c "import caiman; print(caiman.__version__)"
+```
+
+Both should succeed without errors.
+
+---
+
+After activating either environment, open `params.py` and set:
+```python
+USE_GPU = False   # CPU environment
+USE_GPU = True    # GPU environment
+```
+
+This single flag controls GPU acceleration for Cellpose, motion correction, and CNMF.
+
+**Key dependencies:** CaImAn ≥ 1.12, Cellpose ≥ 3, PyTorch ≥ 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
 
 ## Usage
 
-Install the GUI and test dependencies, then launch `gui.py`:
+Launch the GUI (Anaconda Prompt):
 
-```bash
-pip install customtkinter pytest
 ```
-
-```bash
-pip install customtkinter
 python gui.py
 ```
 
