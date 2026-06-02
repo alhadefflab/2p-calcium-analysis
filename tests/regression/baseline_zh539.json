@@ -1,0 +1,73 @@
+{
+  "dataset": "ZH539",
+  "z_planes": {
+    "z1": {
+      "neuron_count": 38,
+      "mean_snr": 1.1161048819482293,
+      "mean_r_value": 0.8909893596762938
+    },
+    "z2": {
+      "neuron_count": 100,
+      "mean_snr": 1.6360587666676187,
+      "mean_r_value": 0.8819991992474404
+    },
+    "z3": {
+      "neuron_count": 95,
+      "mean_snr": 1.6276088519029794,
+      "mean_r_value": 0.8938805283270098
+    },
+    "z4": {
+      "neuron_count": 73,
+      "mean_snr": 1.7497121522632126,
+      "mean_r_value": 0.9019375393857788
+    },
+    "z5": {
+      "neuron_count": 66,
+      "mean_snr": 1.6200140793212485,
+      "mean_r_value": 0.89027018287791
+    },
+    "z6": {
+      "neuron_count": 63,
+      "mean_snr": 1.5694112102880284,
+      "mean_r_value": 0.8993780258740788
+    }
+  },
+  "motion_correction": {
+    "z1": {
+      "mean_shift_px": 3.019844357976654,
+      "max_shift_px": 5.9
+    },
+    "z2": {
+      "mean_shift_px": 3.020136186770428,
+      "max_shift_px": 6.0
+    },
+    "z3": {
+      "mean_shift_px": 3.118482490272374,
+      "max_shift_px": 6.2
+    },
+    "z4": {
+      "mean_shift_px": 3.3159533073929963,
+      "max_shift_px": 6.6
+    },
+    "z5": {
+      "mean_shift_px": 3.473346303501945,
+      "max_shift_px": 7.0
+    },
+    "z6": {
+      "mean_shift_px": 3.540953307392996,
+      "max_shift_px": 7.0
+    }
+  },
+  "analysis": {
+    "stim1_only": 15,
+    "both": 8,
+    "stim2_only": 188,
+    "total_responders": 211
+  },
+  "tolerances": {
+    "neuron_count_pct": 15,
+    "responder_count_pct": 20,
+    "mean_snr_abs": 0.5,
+    "mean_shift_px_abs": 1.0
+  }
+}
