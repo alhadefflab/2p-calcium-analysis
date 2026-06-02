@@ -36,6 +36,17 @@ class TestNeuronCounts:
             f"got {sorted(got_zplanes)}"
         )
 
+    def test_neuron_count_per_zplane(self, zh539_analysis_results, baseline):
+        tol = baseline["tolerances"]["neuron_count_pct"] / 100
+        for z, expected in baseline["z_planes"].items():
+            got = zh539_analysis_results["z_planes"][z]["neuron_count"]
+            exp = expected["neuron_count"]
+            pct_diff = abs(got - exp) / max(exp, 1)
+            assert pct_diff <= tol, (
+                f"{z}: neuron count {got} differs from baseline {exp} "
+                f"by {pct_diff*100:.1f}% (tolerance {tol*100:.0f}%)"
+            )
+
     def test_no_zplane_is_empty(self, zh539_analysis_results):
         for z, m in zh539_analysis_results["z_planes"].items():
             assert m["neuron_count"] > 0, f"{z}: no neurons found"

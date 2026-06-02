@@ -14,7 +14,7 @@ import matplotlib.cm as cm
 
 import caiman
 from caiman.base.rois import com
-from visualizationKB import get_contours
+from visualization.roi_legacy import get_contours
 
 import glob
 from caiman.source_extraction.cnmf import cnmf 

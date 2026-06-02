@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# Legacy module — preserved from visualizationKB.py; not actively extended.
 
 """ List of plotting functions to visualize what's happening in the code """
 
