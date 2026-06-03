@@ -717,7 +717,7 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
 
     cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
 
-    # Optional post-CNMF interactive neuron curation (Suite2p-style viewer)
+    # Optional post-CNMF interactive neuron curation
     _is_cell_file = None
     if neuron_viewer_fn is not None:
         is_cell = neuron_viewer_fn(cnm, func_lc)

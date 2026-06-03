@@ -1,4 +1,4 @@
-"""Suite2p-style post-CNMF neuron browser.
+"""Post-CNMF neuron browser.
 
 Opens after source extraction to let the user inspect each neuron's
 fluorescence trace and animated spatial footprint, then accept or reject
