@@ -14,22 +14,25 @@ The pipeline takes raw multi-channel `.tif` stacks from two-photon microscopy se
 3. **Rigid / piecewise-rigid motion correction** — fine-grained within-session correction using [CaImAn](https://github.com/flatironinstitute/CaImAn)
 4. **ROI identification** — cell segmentation via [Cellpose](https://github.com/MouseLand/cellpose) in seeded mode
 5. **Source extraction (CNMF)** — constrained nonnegative matrix factorization via CaImAn; seeded by Cellpose masks; followed by `evaluate_components` + `select_components` to remove noise and neuropil components before traces are saved
-6. **Analysis & visualization** — stimulus-aligned response analysis (`pipeline_funcs.py`) and interactive plots via Bokeh and matplotlib (`visualizationKB.py`)
-7. **GUI** *(recently added — required)* — `gui.py` is now the recommended entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments. See **Usage** below.
+6. **Analysis & visualization** — stimulus-aligned response analysis (`pipeline_funcs.py`) and plots via matplotlib (`visualization/response_plots.py`)
+7. **GUI** — `gui.py` is the recommended entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1–4 stimulus conditions. See **Usage** below.
 
 Provenance is tracked automatically in a `provenance.yaml` file so each processing step can be skipped on re-runs if outputs already exist.
 
 ## File Structure
 
 ```
-gui.py               # GUI entry point (start here)
-pipeline.py          # Core pipeline steps (load, motion correct, source extract)
-pipeline_funcs.py    # Post-extraction analysis (stimulus alignment, response calculation)
-pipeline_utils.py    # Utilities (TIFF combining, YAML provenance, argument capture)
-params.py            # All tunable parameters (MC, CNMF, video, ROI settings) + USE_GPU flag
-visualizationKB.py   # Visualization functions (Bokeh interactive + matplotlib)
-environment-cpu.yml  # Conda environment — CPU-only (no GPU required)
-environment-gpu.yml  # Conda environment — CUDA GPU acceleration
+gui.py                         # Entry point — launches the GUI
+gui/app.py                     # Main GUI window (tabs, pipeline runner)
+gui/roi_editor.py              # Interactive ROI editor (Tkinter canvas)
+pipeline.py                    # Core pipeline steps (load, motion correct, source extract)
+pipeline_funcs.py              # Post-extraction analysis (z-scoring, responder classification)
+pipeline_utils.py              # Utilities (TIFF combining, YAML provenance, argument capture)
+params.py                      # Default parameters for MC, CNMF, Cellpose; USE_GPU auto-detected
+visualization/response_plots.py  # Response heatmaps, bar charts, region plots
+visualization/roi_legacy.py    # Legacy Bokeh ROI visualization helpers
+environment-cpu.yml            # Conda environment — CPU-only
+environment-gpu.yml            # Conda environment — CUDA GPU acceleration
 ```
 
 ## Setup
@@ -87,15 +90,9 @@ Both should succeed without errors.
 
 ---
 
-After activating either environment, open `params.py` and set:
-```python
-USE_GPU = False   # CPU environment
-USE_GPU = True    # GPU environment
-```
+After activating either environment, GPU usage is **automatic** — `params.py` calls `torch.cuda.is_available()` at import time and sets `USE_GPU` accordingly. No manual editing required. If you need to force CPU mode (e.g. to test without a GPU), open `params.py` and hardcode `USE_GPU = False`.
 
-This single flag controls GPU acceleration for Cellpose, motion correction, and CNMF.
-
-**Key dependencies:** CaImAn ≥ 1.12, Cellpose ≥ 3, PyTorch ≥ 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
+**Key dependencies:** CaImAn ≥ 1.12, Cellpose ≥ 4, PyTorch ≥ 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
 
 ## Usage
 
@@ -109,12 +106,47 @@ The GUI walks through four tabs:
 
 | Tab | What to set |
 |-----|-------------|
-| **Animals & Data** | Subject ID, output folder, session folders per animal (one folder per stimulus), single vs. multi-animal mode |
-| **Recording** | Frame period in s/frame (read from the PrairieView `.xml` file), z-planes to analyse, channel assignments. Use **Auto-detect** to scan the session folder and fill in z-planes automatically |
-| **Timing** | Pre-baseline discard, baseline window, and stimulus duration — all in **seconds**. The exact frame counts are shown live as you type |
+| **Animals & Data** | Subject ID, output folder, **number of stimuli (1–4)**, session folders per animal (one folder per stimulus condition), single vs. multi-animal mode |
+| **Recording** | Frame period in s/frame (read from the PrairieView `.xml` file), z-planes to analyse, channel assignments, Cellpose ROI detection parameters (diameter, flow threshold, cell probability threshold) |
+| **Timing** | Pre-baseline discard, baseline window, and stimulus duration — all in **seconds**. The exact frame counts are shown live as you type. **Responder threshold** (z-score, default 1.64) is editable here |
 | **Run** | Select which pipeline stages to run. Uncheck motion correction and CNMF to re-run only the analysis with different timing or threshold settings |
 
 Data should be organized as flat directories of per-frame `.tif` files exported from the acquisition software (PrairieView XML format assumed). Each session folder maps to one stimulus condition.
+
+### Number of stimuli
+
+The **Number of stimuli** selector in the Animals & Data tab controls how many session folders are shown per animal (1 through 4). The analysis adapts automatically:
+
+| N | Behaviour |
+|---|-----------|
+| 1 | Single-stimulus experiment: neurons are classified as responders or non-responders; one heatmap panel |
+| 2 | Two-stimulus comparison (default): neurons split into stim-1-only / both / stim-2-only groups; two heatmap panels |
+| 3–4 | Multi-stimulus: neurons grouped by their primary responding stimulus; N heatmap panels |
+
+### Tunable analysis parameters
+
+The following parameters are set in the GUI **Timing** tab and saved to `params.yaml` alongside each result:
+
+| Parameter | Default | Where to change |
+|-----------|---------|-----------------|
+| Responder z-score threshold | 1.64 (one-tailed p < 0.05) | Timing tab |
+| Pre-baseline discard | 30 s | Timing tab |
+| Baseline window | 30 s | Timing tab |
+| Stimulus duration | 180 s | Timing tab |
+| Frame period | 0.585 s/frame | Recording tab |
+| Cell diameter (Cellpose) | 15 px (or Auto) | Recording tab — Cellpose section |
+| Flow threshold (Cellpose) | 2.0 | Recording tab — Cellpose section |
+| Cell probability threshold (Cellpose) | −1.0 | Recording tab — Cellpose section |
+
+Parameters **not** in the GUI; edit `params.py` directly:
+
+| Parameter | Default | Why you might change it |
+|-----------|---------|------------------------|
+| `CNMF_PARAMS["min_SNR"]` | 2.0 | Minimum SNR for a CNMF component to be accepted; raise to reject more noise |
+| `CNMF_PARAMS["decay_time"]` | 1.8 s | Calcium indicator decay constant — 1.8 s for GCaMP6s, ~0.4 s for faster indicators |
+| `CNMF_PARAMS["p"]` | 2 | AR model order — 2 for GCaMP6s, 1 for faster indicators |
+
+`min_SNR` is the CNMF parameter most likely to need tuning per experiment.
 
 ## Known Bugs / Limitations
 
@@ -122,22 +154,22 @@ Items marked ✅ have been patched. Items marked ❌ are open.
 
 ### Analysis correctness
 
-- ✅ **Stimulus window index offset** — `get_resp1_resp2` was using original frame numbers (103) as indices into `stims1`, which starts 52 frames into the recording. Classification was silently starting ~30 s late. Fixed by correcting the index to 51 (= 103 − 52) in `pipeline_funcs.py` and the matching mean z-score calculation in `analysis_again.py`.
+- ✅ **Stimulus window index offset** — `get_resp1_resp2` was using original frame numbers (103) as indices into `stims1`, which starts 52 frames into the recording. Classification was silently starting ~30 s late. Fixed by correcting the index to 51 (= 103 − 52) in `pipeline_funcs.py`.
 - ✅ **CNMF component quality control missing** — `evaluate_components` + `select_components` were removed at some point during refactoring. Without them, noise components and neuropil patches passed straight through to classification. Both calls have been restored after `cnm.fit()` in `pipeline.py`.
-- ✅ **`get_resp1_resp2` called with wrong number of arguments** — the per-animal loop in `analysis_again.py` was passing 2 arguments to a function that requires 3, crashing immediately on any multi-animal run. Fixed.
-- ✅ **Timing defined in frames instead of seconds** — frame indices were hardcoded as rounded integers, making it impossible to set stimulus timing without editing source code, and causing off-by-one errors when the frame period changed. All timing is now computed from seconds via `round(seconds / frame_period)` and exposed in the GUI.
-- ❌ **No false discovery rate correction** — responders are classified with a fixed z-score threshold of 1.64 (p < 0.05 one-tailed), applied independently to every neuron. With hundreds of neurons tested simultaneously, expected false positives accumulate. Reported counts should be treated as upper bounds; neurons just above the threshold are the most likely to be noise. Standard fix is Benjamini–Hochberg FDR correction.
-- ❌ **Pipeline hardcoded for exactly 2 stimuli** — `get_stims1_stims2` and `get_resp1_resp2` assume exactly two concatenated sessions (e.g. fructose + glucose). Single-stimulus experiments and experiments with 3+ conditions are not supported without manually rewriting the analysis functions. The GUI's `AnimalRow` widget also has fixed Session 1 / Session 2 fields. Deferred to the planned full rebuild.
+- ✅ **`get_resp1_resp2` called with wrong number of arguments** — the per-animal loop was passing 2 arguments to a function that requires 3, crashing immediately on any multi-animal run. Fixed.
+- ✅ **Timing defined in frames instead of seconds** — frame indices were hardcoded as rounded integers. All timing is now computed from seconds via `round(seconds / frame_period)` and exposed in the GUI.
+- ✅ **Pipeline hardcoded for exactly 2 stimuli** — `get_stims1_stims2` and `get_resp1_resp2` assumed exactly two concatenated sessions. Replaced by `get_stims_n` / `get_resp_n` which support 1–4 stimuli. The GUI's **Number of stimuli** selector sets the count globally; old two-stimulus callers remain as thin wrappers for backward compatibility.
+- ❌ **No false discovery rate correction** — responders are classified with a fixed z-score threshold (default 1.64, p < 0.05 one-tailed), applied independently to every neuron. With hundreds of neurons tested simultaneously, expected false positives accumulate. Standard fix is Benjamini–Hochberg FDR correction.
 
 ### Code quality / environment
 
 - ✅ **Video output filename typo** — source extraction video was saved as `conat_…` instead of `concat_…`. Fixed in `pipeline.py`.
+- ✅ **`environment.yml` encoding and prefix** — the original `environment.yml` was saved as UTF-16 LE and contained a hardcoded `prefix:` path. Replaced by `environment-cpu.yml` and `environment-gpu.yml`, both standard UTF-8 with no prefix.
+- ✅ **`analysis_again.py` contains hardcoded subject/path references** — file removed; the GUI replaces this workflow.
+- ✅ **`scratch.py` has dead code** — file removed.
+- ✅ **No unit tests** — unit and regression tests now exist in `tests/`. See [docs/testing.md](docs/testing.md).
 - ❌ **`multi_crop_len` defined but never used** — `params.py` defines `multi_crop_len` but `_load_data` only uses `multi_crop_start`, cropping with no upper bound. If sessions differ in total frame count the output arrays will have inconsistent lengths.
 - ❌ **`_load_data` channel count not validated** — no check that channel counts or frame dimensions match across sessions before concatenation.
-- ❌ **`environment.yml` encoding and prefix** — the file is saved as UTF-16 LE, which `conda env create` cannot parse. It also contains a hardcoded `prefix:` path pointing to the original developer's machine that must be removed before install.
-- ❌ **`analysis_again.py` contains hardcoded subject/path references** — subject ID and data paths are hardcoded and must be edited manually for each experiment. The GUI replaces this workflow but the underlying script still has the hardcoded values.
-- ❌ **`scratch.py` has dead code** — references the old class-based `Pipeline` API which no longer exists, and contains duplicate variable assignments. The file does not run as-is.
-- ✅ **No unit tests** — unit and regression tests now exist in `tests/`. See [docs/testing.md](docs/testing.md).
 
 ## Data
 

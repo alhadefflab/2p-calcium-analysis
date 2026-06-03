@@ -321,6 +321,26 @@ def _session_window_indices(ses1_len, pre_f, base_f, stim_f):
     )
 
 
+def _session_window_indices_n(session_lengths, pre_f, base_f, stim_f):
+    """Baseline/stim windows for an N-session concatenated recording.
+
+    Returns a list of N dicts, each with keys:
+        bline_start, bline_end, stim_start, stim_end
+    The offset accumulates across sessions using the actual session lengths.
+    """
+    windows = []
+    offset = 0
+    for ses_len in session_lengths:
+        windows.append(dict(
+            bline_start = offset + pre_f,
+            bline_end   = offset + pre_f + base_f,
+            stim_start  = offset + pre_f + base_f,
+            stim_end    = offset + pre_f + base_f + stim_f,
+        ))
+        offset += ses_len
+    return windows
+
+
 def _session_lengths(provenance, z):
     """Per-session frame counts read from the affine-corrected TIFFs."""
     from tifffile import TiffFile
@@ -333,111 +353,153 @@ def _session_lengths(provenance, z):
     return lengths
 
 
-def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
-    stims1 = []
-    stims2 = []
+def get_stims_n(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
+    """Return per-stimulus windowed z-score arrays for all neurons across N sessions.
+
+    Returns
+    -------
+    stims_n : list of N arrays, each (K_total, base_f + stim_f)
+              One array per session; rows are neurons, columns are baseline+stim frames.
+    z_ids   : int array (K_total,) — z-plane label for each neuron row
+    """
+    from caiman.source_extraction.cnmf import cnmf as cnmf_module
+
+    ch_dict = provenance['load_data']['args']['ch_dict']
+    zs = list(provenance['source_extraction'].keys())
+
+    stims_accum = None   # list of N lists, initialised on first z-plane
     z_ids = []
 
-    zs = provenance['source_extraction'].keys()
+    pre_f  = round(pre_discard_s / frame_period)
+    base_f = round(baseline_s    / frame_period)
+    stim_f = round(stim_s        / frame_period)
 
-    for i, z in enumerate(zs):
+    for z in zs:
         cnm_file = provenance['source_extraction'][z]['filenames']['cnm_file']
-        imgs_path = provenance['rigid_motion_correction'][z]['filenames']['ch2']
+        cnm = cnmf_module.load_CNMF(cnm_file)
+        K = cnm.estimates.A.shape[1]
 
-        Yr, dims, T = caiman.load_memmap(imgs_path)
-        imgs = np.reshape(Yr.T, [T] + list(dims), order='F')
-        img = imgs.max(axis=0)
+        session_lengths = _session_lengths(provenance, z)
+        N = len(session_lengths)
+        total_T = sum(session_lengths)
 
-        cnm = cnmf.load_CNMF(cnm_file)
-        center = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
+        for j, ses_len in enumerate(session_lengths):
+            if pre_f + base_f + stim_f > ses_len:
+                raise ValueError(
+                    f"z={z} session {j + 1}: analysis window "
+                    f"({pre_f + base_f + stim_f} frames) exceeds session length "
+                    f"({ses_len} frames). Reduce stim_s, baseline_s, or pre_discard_s."
+                )
 
+        windows = _session_window_indices_n(session_lengths, pre_f, base_f, stim_f)
 
-        #why(provenance, cnm, center)
-
-        pre_f  = round(pre_discard_s / frame_period)
-        base_f = round(baseline_s    / frame_period)
-        stim_f = round(stim_s        / frame_period)
-
-        # Anchor session-2 windows to the *real* session-1 length, not a value
-        # derived from stim_s. Mismatch here is the bug that made baselines
-        # leak across sessions.
-        ses1_len = _session_lengths(provenance, z)[0]
-
-        if pre_f + base_f + stim_f > ses1_len:
+        if stims_accum is None:
+            stims_accum = [[] for _ in range(N)]
+        elif len(stims_accum) != N:
             raise ValueError(
-                f"Session-1 analysis window ({pre_f + base_f + stim_f} frames) "
-                f"exceeds session-1 length ({ses1_len} frames). Reduce stim_s, "
-                f"baseline_s, or pre_discard_s."
-            )
-        if ses1_len + pre_f + base_f + stim_f > T:
-            raise ValueError(
-                f"Session-2 analysis window ends at frame "
-                f"{ses1_len + pre_f + base_f + stim_f} but the concatenated "
-                f"recording has only {T} frames."
+                f"z-plane {z} has {N} sessions but earlier z-planes had "
+                f"{len(stims_accum)}. Session counts must match across z-planes."
             )
 
-        w = _session_window_indices(ses1_len, pre_f, base_f, stim_f)
+        for j, w in enumerate(windows):
+            fl = custom_df_f_startend(cnm, w['bline_start'], w['bline_end'],
+                                      method='zscore', use_residuals=True)
+            stims_accum[j].append(fl[:, w['bline_start']:w['stim_end']])
 
-        fl_acc1 = custom_df_f_startend(cnm, w['bline1_start'], w['bline1_end'], method='zscore', use_residuals=True)
-        fl_acc2 = custom_df_f_startend(cnm, w['bline2_start'], w['bline2_end'], method='zscore', use_residuals=True)
+        z_ids.extend([int(z.replace('z', ''))] * K)
 
-        stim1 = fl_acc1[:, w['bline1_start']:w['stim1_end']]
-        stim2 = fl_acc2[:, w['bline2_start']:w['stim2_end']]
-
-        stims1.append(stim1)
-        stims2.append(stim2)
-
-        z_ids.extend([int(z.replace('z', ''))]*stim1.shape[0])
+    stims_n = [np.vstack(acc) for acc in stims_accum]
+    return stims_n, np.array(z_ids)
 
 
-    stims1 = np.vstack(stims1)
-    stims2 = np.vstack(stims2)
+def get_stims1_stims2(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30, stim_s=360):
+    """Backward-compatible wrapper around get_stims_n for exactly 2 sessions."""
+    stims_n, z_ids = get_stims_n(provenance, frame_period, pre_discard_s, baseline_s, stim_s)
+    if len(stims_n) != 2:
+        raise ValueError(
+            f"get_stims1_stims2 requires exactly 2 sessions; got {len(stims_n)}. "
+            "Use get_stims_n for experiments with more or fewer stimuli."
+        )
+    return stims_n[0], stims_n[1], z_ids
 
-    return stims1, stims2, np.r_[z_ids]
+
+def get_resp_n(stims_n, z_ids, stim_onset_idx=51, threshold=1.64):
+    """Classify and sort responders across N stimuli.
+
+    For N=2 reproduces the exact categorisation from get_resp1_resp2:
+        group 0 — stim-1-only  (sorted by stim-1 median z-score, descending)
+        group 1 — both         (sorted by stim-1 median z-score, descending)
+        group 2 — stim-2-only  (sorted by stim-2 median z-score, descending)
+
+    For N=1:
+        group 0 — responders   (sorted by stim-1 median z-score, descending)
+
+    For N=3 or 4:
+        group j — neurons whose highest median z-score is stimulus j
+                  (sorted by that stimulus's median z-score, descending)
+
+    Returns
+    -------
+    resp_n      : list of N arrays (K_resp, T)
+    nums        : for N=2: [n_stim1only, n_both, n_stim2only]
+                  otherwise: [n_resp_stim_j, …]  (may double-count)
+    group_sizes : list of int — rows per display group (sidebar colouring)
+    z_ids_resp  : (K_resp,) int array — z-plane label per sorted row
+    """
+    N = len(stims_n)
+    start = stim_onset_idx
+    T = stims_n[0].shape[1]
+
+    medians = np.array([np.median(s[:, start:], axis=1) for s in stims_n]).T  # (K, N)
+    responds = medians > threshold  # (K, N)
+
+    def _sort_indices(mask, key_col):
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            return idx
+        return idx[np.argsort(-medians[idx, key_col])]
+
+    if N == 1:
+        g0 = _sort_indices(responds[:, 0], 0)
+        sorted_idx = g0
+        nums = [int(responds[:, 0].sum())]
+        group_sizes = [len(g0)]
+
+    elif N == 2:
+        r1 = responds[:, 0];  r2 = responds[:, 1]
+        g0 = _sort_indices(r1 & ~r2, 0)
+        g1 = _sort_indices(r1 &  r2, 0)
+        g2 = _sort_indices(~r1 & r2, 1)
+        sorted_idx = np.concatenate([g0, g1, g2])
+        nums = [int((r1 & ~r2).sum()), int((r1 & r2).sum()), int((~r1 & r2).sum())]
+        group_sizes = [len(g0), len(g1), len(g2)]
+
+    else:  # N = 3 or 4: group by primary stimulus
+        any_resp = responds.any(axis=1)
+        resp_idx = np.where(any_resp)[0]
+        if len(resp_idx) == 0:
+            return ([np.empty((0, T)) for _ in stims_n],
+                    [0] * N, [0] * N, np.array([], dtype=int))
+        primary = np.argmax(medians[resp_idx], axis=1)
+        groups = [_sort_indices(
+                      np.isin(np.arange(len(stims_n[0])), resp_idx[primary == j]),
+                      j)
+                  for j in range(N)]
+        sorted_idx = np.concatenate(groups)
+        nums = [int(responds[:, j].sum()) for j in range(N)]
+        group_sizes = [len(g) for g in groups]
+
+    resp_n = [s[sorted_idx] for s in stims_n]
+    return resp_n, nums, group_sizes, z_ids[sorted_idx]
+
 
 def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
-    start, end = stim_onset_idx, stims1.shape[1]
-
-    responder_stim1 = (np.median(stims1[:, start:end], axis=1) > threshold)
-    responder_stim2 = (np.median(stims2[:, start:end], axis=1) > threshold)
-
-    r_stim1only = responder_stim1 & ~responder_stim2
-    r_stim2only = ~responder_stim1 & responder_stim2
-    r_stim12 = responder_stim1 & responder_stim2
-
-
-
-
-    s1_1 = sorted(stims1[r_stim1only], key=lambda x : np.median(x[start:end]))
-    s1_1 = np.array(s1_1)[::-1]
-
-    s1_12 = sorted(stims1[r_stim12], key=lambda x : np.median(x[start:end]))
-    s1_12 = np.array(s1_12)[::-1]
-    
-    s1_2 = sorted(stims1[r_stim2only], key=lambda x : np.median(x[start:end]))
-    s1_2 = np.array(s1_2)[::-1]
-
-
-    s2_1 = sorted(stims2[r_stim1only], key=lambda x : np.median(x[start:end]))
-    s2_1 = np.array(s2_1)[::-1]
-
-    s2_12 = sorted(stims2[r_stim12], key=lambda x : np.median(x[start:end]))
-    s2_12 = np.array(s2_12)[::-1]
-    
-    s2_2 = sorted(stims2[r_stim2only], key=lambda x : np.median(x[start:end]))
-    s2_2 = np.array(s2_2)[::-1]
-    
-    arrays1 = [a for a in [s1_1, s1_12, s1_2] if a.shape[0] > 0]
-    resp1 = np.vstack(arrays1) if arrays1 else np.empty((0, stims1.shape[1]))
-
-    arrays2 = [a for a in [s2_1, s2_12, s2_2] if a.shape[0] > 0]
-    resp2 = np.vstack(arrays2) if arrays2 else np.empty((0, stims2.shape[1]))
-
-    nums = [r_stim1only.sum(), r_stim12.sum(), r_stim2only.sum()]
-
-    z_ids_sel = [z_ids[r_stim1only], z_ids[r_stim12], z_ids[r_stim2only]]
-
-    return resp1, resp2, nums, z_ids_sel
+    """Backward-compatible wrapper around get_resp_n for exactly 2 stimuli."""
+    resp_n, nums, group_sizes, z_ids_resp = get_resp_n(
+        [stims1, stims2], z_ids, stim_onset_idx, threshold)
+    g0, g1, g2 = group_sizes
+    z_ids_sel = [z_ids_resp[:g0], z_ids_resp[g0:g0 + g1], z_ids_resp[g0 + g1:]]
+    return resp_n[0], resp_n[1], nums, z_ids_sel
 
 
 def get_region_labels(provenance, subregion_dir):

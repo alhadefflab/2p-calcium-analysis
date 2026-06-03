@@ -476,7 +476,7 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
         plt.imshow(func_lc)
 
     ###
-    model = models.CellposeModel(pretrained_model=model_type, gpu=gpu)
+    model = models.CellposeModel(model_type=model_type, gpu=gpu)
     masks, _, _ = model.eval(func_lc, diameter=diameter,
                              flow_threshold=flow_threshold,
                              cellprob_threshold=cellprob_threshold)
@@ -586,7 +586,7 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
     from caiman.source_extraction.cnmf import cnmf
     from caiman.source_extraction.cnmf import params
 
-    opts = params.CNMFParams(params_dict=inputs, allow_legacy=True)
+    opts = params.CNMFParams(params_dict=inputs)
 
 
     _, dview, n_processes = cm.cluster.setup_cluster(
