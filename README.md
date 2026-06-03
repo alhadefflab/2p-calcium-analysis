@@ -14,8 +14,10 @@ The pipeline takes raw multi-channel `.tif` stacks from two-photon microscopy se
 3. **Rigid / piecewise-rigid motion correction** — fine-grained within-session correction using [CaImAn](https://github.com/flatironinstitute/CaImAn)
 4. **ROI identification** — cell segmentation via [Cellpose](https://github.com/MouseLand/cellpose) in seeded mode
 5. **Source extraction (CNMF)** — constrained nonnegative matrix factorization via CaImAn; seeded by Cellpose masks; followed by `evaluate_components` + `select_components` to remove noise and neuropil components before traces are saved
-6. **Analysis & visualization** — stimulus-aligned response analysis (`pipeline_funcs.py`) and plots via matplotlib (`visualization/response_plots.py`)
-7. **GUI** — `gui.py` is the recommended entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1–4 stimulus conditions. See **Usage** below.
+6. **Neuron curation** — post-CNMF interactive browser (`gui/neuron_viewer.py`); inspect individual fluorescence traces and calcium mini-video; accept or reject components; saves `is_cell` mask per z-plane without re-running CNMF
+7. **Multi-plane duplicate review** — cross-z-plane duplicate detection using Jaccard IoU of spatial masks and trace correlation 3-D neuron reconstruction via plotly; interactive resolution per pair; see `docs/multiplane_duplicate_review.md`
+8. **Analysis & visualization** — stimulus-aligned response analysis (`pipeline_funcs.py`) and plots via matplotlib (`visualization/response_plots.py`); `is_cell` masks from curation and duplicate review are applied automatically
+9. **GUI** — `gui.py` is the recommended entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1-4 stimulus conditions. See **Usage** below.
 
 Provenance is tracked automatically in a `provenance.yaml` file so each processing step can be skipped on re-runs if outputs already exist.
 
@@ -25,12 +27,16 @@ Provenance is tracked automatically in a `provenance.yaml` file so each processi
 gui.py                         # Entry point — launches the GUI
 gui/app.py                     # Main GUI window (tabs, pipeline runner)
 gui/roi_editor.py              # Interactive ROI editor (Tkinter canvas)
+gui/neuron.py                  # Neuron dataclass wrapping one CNMF component
+gui/neuron_viewer.py           # Post-CNMF neuron browser (trace display, accept/reject)
+gui/zplane_viewer.py           # Multi-plane duplicate review (3-D map, IoU detection)
 pipeline.py                    # Core pipeline steps (load, motion correct, source extract)
 pipeline_funcs.py              # Post-extraction analysis (z-scoring, responder classification)
 pipeline_utils.py              # Utilities (TIFF combining, YAML provenance, argument capture)
 params.py                      # Default parameters for MC, CNMF, Cellpose; USE_GPU auto-detected
 visualization/response_plots.py  # Response heatmaps, bar charts, region plots
 visualization/roi_legacy.py    # Legacy Bokeh ROI visualization helpers
+docs/multiplane_duplicate_review.md  # Full guide to the multi-plane duplicate review feature
 environment-cpu.yml            # Conda environment — CPU-only
 environment-gpu.yml            # Conda environment — CUDA GPU acceleration
 ```
@@ -92,7 +98,9 @@ Both should succeed without errors.
 
 After activating either environment, GPU usage is **automatic** — `params.py` calls `torch.cuda.is_available()` at import time and sets `USE_GPU` accordingly. No manual editing required. If you need to force CPU mode (e.g. to test without a GPU), open `params.py` and hardcode `USE_GPU = False`.
 
-**Key dependencies:** CaImAn ≥ 1.12, Cellpose ≥ 4, PyTorch ≥ 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
+**Key dependencies:** CaImAn >= 1.12, Cellpose >= 4, PyTorch >= 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
+
+**Optional:** plotly >= 5.0 — required for the 3-D neuron reconstruction view in Multi-plane Duplicate Review. Included in both conda environment files. Install manually if needed: `pip install plotly`
 
 ## Usage
 
@@ -154,20 +162,10 @@ Items marked ✅ have been patched. Items marked ❌ are open.
 
 ### Analysis correctness
 
-- ✅ **Stimulus window index offset** — `get_resp1_resp2` was using original frame numbers (103) as indices into `stims1`, which starts 52 frames into the recording. Classification was silently starting ~30 s late. Fixed by correcting the index to 51 (= 103 − 52) in `pipeline_funcs.py`.
-- ✅ **CNMF component quality control missing** — `evaluate_components` + `select_components` were removed at some point during refactoring. Without them, noise components and neuropil patches passed straight through to classification. Both calls have been restored after `cnm.fit()` in `pipeline.py`.
-- ✅ **`get_resp1_resp2` called with wrong number of arguments** — the per-animal loop was passing 2 arguments to a function that requires 3, crashing immediately on any multi-animal run. Fixed.
-- ✅ **Timing defined in frames instead of seconds** — frame indices were hardcoded as rounded integers. All timing is now computed from seconds via `round(seconds / frame_period)` and exposed in the GUI.
-- ✅ **Pipeline hardcoded for exactly 2 stimuli** — `get_stims1_stims2` and `get_resp1_resp2` assumed exactly two concatenated sessions. Replaced by `get_stims_n` / `get_resp_n` which support 1–4 stimuli. The GUI's **Number of stimuli** selector sets the count globally; old two-stimulus callers remain as thin wrappers for backward compatibility.
 - ❌ **No false discovery rate correction** — responders are classified with a fixed z-score threshold (default 1.64, p < 0.05 one-tailed), applied independently to every neuron. With hundreds of neurons tested simultaneously, expected false positives accumulate. Standard fix is Benjamini–Hochberg FDR correction.
 
 ### Code quality / environment
 
-- ✅ **Video output filename typo** — source extraction video was saved as `conat_…` instead of `concat_…`. Fixed in `pipeline.py`.
-- ✅ **`environment.yml` encoding and prefix** — the original `environment.yml` was saved as UTF-16 LE and contained a hardcoded `prefix:` path. Replaced by `environment-cpu.yml` and `environment-gpu.yml`, both standard UTF-8 with no prefix.
-- ✅ **`analysis_again.py` contains hardcoded subject/path references** — file removed; the GUI replaces this workflow.
-- ✅ **`scratch.py` has dead code** — file removed.
-- ✅ **No unit tests** — unit and regression tests now exist in `tests/`. See [docs/testing.md](docs/testing.md).
 - ❌ **`multi_crop_len` defined but never used** — `params.py` defines `multi_crop_len` but `_load_data` only uses `multi_crop_start`, cropping with no upper bound. If sessions differ in total frame count the output arrays will have inconsistent lengths.
 - ❌ **`_load_data` channel count not validated** — no check that channel counts or frame dimensions match across sessions before concatenation.
 

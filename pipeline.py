@@ -634,7 +634,7 @@ def _visualize_src_extraction_results(self, idx=[41]):
 
 
 @capture_args
-def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, **kwargs):
+def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, neuron_viewer_fn=None, **kwargs):
 
     import glob 
 
@@ -715,18 +715,29 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
         roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask = _addremove_rois_manually(
             output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
 
-    cnm, cnm_file =  _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
+    cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
+
+    # Optional post-CNMF interactive neuron curation
+    _is_cell_file = None
+    if neuron_viewer_fn is not None:
+        is_cell = neuron_viewer_fn(cnm, func_lc)
+        if is_cell is not None:
+            _is_cell_file = output_dir / f'concat_{z}_is_cell.npy'
+            np.save(_is_cell_file, is_cell)
 
     _save_source_extraction_video(cnm, z, output_dir)
 
-    #_visualize_src_extraction_results() 
+    #_visualize_src_extraction_results()
 
     #provenance['source_extraction']['args'] = kwargs['__args_dict']
     provenance['source_extraction'][z] = {}
-    provenance['source_extraction'][z]['filenames'] = {
+    _se_filenames = {
         'roi_masks_file': roi_masks_file,
-        'cnm_file': cnm_file
+        'cnm_file': cnm_file,
     }
+    if _is_cell_file is not None:
+        _se_filenames['is_cell_file'] = str(_is_cell_file)
+    provenance['source_extraction'][z]['filenames'] = _se_filenames
     # provenance['source_extraction']['aux_filenames'] = {
     #     'mc_files' : mc_files,
     #     'func_files' : func_files,

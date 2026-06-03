@@ -597,6 +597,16 @@ class PipelineGUI(ctk.CTk):
             text="Sub-region setup  —  (re)define sub-regions without re-running CNMF")
         self.do_subregion_setup.pack(anchor="w", padx=16, pady=4)
 
+        self.do_neuron_curation = ctk.CTkCheckBox(
+            stages,
+            text="Neuron curation  —  re-open neuron viewer on saved CNMF, accept / reject without re-running")
+        self.do_neuron_curation.pack(anchor="w", padx=16, pady=4)
+
+        self.do_multiplane_review = ctk.CTkCheckBox(
+            stages,
+            text="Multi-plane duplicate review  —  3-D map across z-planes, detect and resolve duplicate neurons  (2+ planes)")
+        self.do_multiplane_review.pack(anchor="w", padx=16, pady=4)
+
         self.do_analysis = ctk.CTkCheckBox(
             stages,
             text="Stimulus response analysis  —  fast, re-run this after changing timing or threshold")
@@ -788,6 +798,108 @@ class PipelineGUI(ctk.CTk):
 
         return new_masks, roi_masks_file, new_bkg, new_mask_img
 
+    def _neuron_viewer_for_pipeline(self, cnm, mean_img, provenance=None, z=None):
+        """Called from the worker thread. Opens NeuronViewerWindow on the main thread
+        and blocks until the user clicks Save & Close."""
+        from gui.neuron import Neuron
+        from gui.neuron_viewer import NeuronViewerWindow
+
+        self._log("  Building neuron list from CNMF estimates …")
+        neurons = Neuron.build_all(cnm.estimates)   # pure numpy — safe on worker thread
+        self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
+
+        # Build timing_info for trace annotations if we have session data
+        timing_info = None
+        if provenance is not None and z is not None:
+            try:
+                from pipeline_funcs import _session_lengths
+                ses_lens = _session_lengths(provenance, z)
+                fp    = getattr(self, '_current_fp',     0.033)
+                pre_s = getattr(self, '_current_pre_s',  30.0)
+                base_s = getattr(self, '_current_base_s', 30.0)
+                stim_s = getattr(self, '_current_stim_s', 180.0)
+                timing_info = dict(
+                    fp=fp,
+                    pre_f=round(pre_s  / fp),
+                    base_f=round(base_s / fp),
+                    stim_f=round(stim_s / fp),
+                    session_lengths=ses_lens,
+                )
+            except Exception as _e:
+                self._log(f"  (timing annotations unavailable: {_e})")
+
+        result_holder = [None]
+        done = threading.Event()
+
+        def _show():
+            def _on_close(is_cell):
+                n_acc = int(is_cell.sum())
+                result_holder[0] = is_cell
+                self._log(f"  Neuron viewer closed — {n_acc} / {len(neurons)} accepted.")
+                done.set()
+            NeuronViewerWindow(
+                self, neurons, mean_img,
+                frame_period=getattr(self, '_current_fp', 0.033),
+                on_close=_on_close,
+                timing_info=timing_info,
+            )
+
+        self.after(0, _show)
+        done.wait()
+        return result_holder[0]
+
+    def _multiplane_viewer_for_pipeline(self, provenance, z_planes):
+        """Load all z-planes, open ZPlaneViewerWindow on the main thread, block until done."""
+        import caiman as cm
+        from caiman.source_extraction.cnmf import cnmf as _cnmf_module
+        from gui.neuron import Neuron
+        from gui.zplane_viewer import ZPlaneViewerWindow
+        from pipeline_funcs import _load_is_cell
+
+        plane_data = []
+        ch_dict = provenance['load_data']['args']['ch_dict']
+        for z in z_planes:
+            se = (provenance.get('source_extraction') or {}).get(z)
+            if not se:
+                self._log(f"  ⚠ No CNMF results for {z} — skipping.")
+                continue
+            cnm_file = se['filenames']['cnm_file']
+            if not Path(cnm_file).exists():
+                self._log(f"  ⚠ CNMF file not found: {cnm_file}")
+                continue
+
+            func_corr_file = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['func_ch']]
+            if not Path(func_corr_file).is_absolute():
+                func_corr_file = str(Path(func_corr_file))
+
+            self._log(f"  Loading {z} …")
+            cnm      = _cnmf_module.load_CNMF(cnm_file)
+            neurons  = Neuron.build_all(cnm.estimates)
+            is_cell  = _load_is_cell(cnm_file, z)
+            if is_cell is None:
+                is_cell = np.ones(len(neurons), dtype=bool)
+            func_lc = np.percentile(cm.load(func_corr_file), 99, axis=0)
+
+            plane_data.append(dict(
+                z=z, neurons=neurons, is_cell=is_cell, mean_image=func_lc))
+
+        if len(plane_data) < 2:
+            self._log("  Multi-plane review needs at least 2 z-planes with CNMF — skipping.")
+            return {}
+
+        result_holder = [None]
+        done = threading.Event()
+
+        def _show():
+            def _on_close(updated):
+                result_holder[0] = updated
+                done.set()
+            ZPlaneViewerWindow(self, plane_data, on_close=_on_close)
+
+        self.after(0, _show)
+        done.wait()
+        return result_holder[0] or {}
+
     def _run_pipeline(self, p: dict):
         class _StdoutCapture:
             def __init__(self, fn):
@@ -822,6 +934,10 @@ class PipelineGUI(ctk.CTk):
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
                                       p["baseline_s"],   p["stim_s"])
+        self._current_fp     = fp      # made available to _neuron_viewer_for_pipeline
+        self._current_pre_s  = pre_s
+        self._current_base_s = base_s
+        self._current_stim_s = stim_s
         threshold = p["threshold"]
         n_stims   = p["n_stims"]
 
@@ -873,8 +989,15 @@ class PipelineGUI(ctk.CTk):
                     self._log(
                         f"  Source extraction ({z}) — "
                         "ROI editor will open in a popup window …")
+                    def _make_viewer_fn(z_name):
+                        def _fn(cnm, img):
+                            return self._neuron_viewer_for_pipeline(
+                                cnm, img, provenance, z_name)
+                        return _fn
                     provenance = source_extraction(
-                        provenance, None, z, None, roi_editor_fn=roi_fn,
+                        provenance, None, z, None,
+                        roi_editor_fn=roi_fn,
+                        neuron_viewer_fn=_make_viewer_fn(z),
                         idroi_params=cp)
             else:
                 self._log("  Skipping CNMF — using saved results.")
@@ -929,6 +1052,65 @@ class PipelineGUI(ctk.CTk):
                 except Exception:
                     self._log("  ⚠ Sub-region setup failed:")
                     self._log(traceback.format_exc())
+
+            if self.do_neuron_curation.get():
+                self._log("  Neuron curation — loading saved CNMF, opening viewer …")
+                try:
+                    import caiman as cm
+                    from caiman.source_extraction.cnmf import cnmf as _cnmf_module
+                    ch_dict = provenance['load_data']['args']['ch_dict']
+                    for z in p["z_planes"]:
+                        se = (provenance.get('source_extraction') or {}).get(z)
+                        if not se:
+                            self._log(f"  ⚠ No CNMF results found for {z} — run CNMF first.")
+                            continue
+                        cnm_file = se['filenames']['cnm_file']
+                        if not Path(cnm_file).exists():
+                            self._log(f"  ⚠ CNMF file not found: {cnm_file}")
+                            continue
+
+                        func_corr_file = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['func_ch']]
+                        if not Path(func_corr_file).is_absolute():
+                            func_corr_file = str(Path(out_dir) / z / Path(func_corr_file).name)
+
+                        self._log(f"    {z}: computing background image …")
+                        func_lc = np.percentile(cm.load(func_corr_file), 99, axis=0)
+
+                        self._log(f"    {z}: loading CNMF …")
+                        cnm = _cnmf_module.load_CNMF(cnm_file)
+
+                        is_cell = self._neuron_viewer_for_pipeline(cnm, func_lc, provenance, z)
+                        if is_cell is not None:
+                            is_cell_file = Path(cnm_file).parent / f'concat_{z}_is_cell.npy'
+                            np.save(is_cell_file, is_cell)
+                            provenance['source_extraction'][z]['filenames']['is_cell_file'] = str(is_cell_file)
+                            _save_provenance(provenance)
+                except Exception:
+                    self._log("  ⚠ Neuron curation failed:")
+                    self._log(traceback.format_exc())
+
+            if self.do_multiplane_review.get():
+                if len(p["z_planes"]) < 2:
+                    self._log("  Multi-plane review skipped — only one z-plane configured.")
+                else:
+                    self._log("  Multi-plane duplicate review — loading all z-planes …")
+                    try:
+                        updated = self._multiplane_viewer_for_pipeline(
+                            provenance, p["z_planes"])
+                        for z, new_is_cell in updated.items():
+                            se = (provenance.get('source_extraction') or {}).get(z)
+                            if not se:
+                                continue
+                            cnm_file    = se['filenames']['cnm_file']
+                            is_cell_file = Path(cnm_file).parent / f'concat_{z}_is_cell.npy'
+                            np.save(is_cell_file, new_is_cell)
+                            provenance['source_extraction'][z]['filenames']['is_cell_file'] = str(is_cell_file)
+                            n_acc = int(new_is_cell.sum())
+                            self._log(f"  {z}: {n_acc} / {len(new_is_cell)} neurons accepted")
+                        _save_provenance(provenance)
+                    except Exception:
+                        self._log("  ⚠ Multi-plane review failed:")
+                        self._log(traceback.format_exc())
 
             if self.do_analysis.get():
                 self._log("  Computing stimulus responses …")

@@ -196,6 +196,13 @@ def show_subregions(img, cnm, area_indices, area_colors):
 
 
 
+def _load_is_cell(cnm_file, z):
+    """Return bool array (K,) from concat_{z}_is_cell.npy, or None if absent."""
+    from pathlib import Path as _P
+    p = _P(cnm_file).parent / f'concat_{z}_is_cell.npy'
+    return np.load(p) if p.exists() else None
+
+
 def custom_df_f(c, baseline, quantileMin = 50, use_residuals = False): #TODO move this to utils
     """
     A custom version of the detrend_df_f function in the original CaImAn code.
@@ -214,26 +221,33 @@ def custom_df_f(c, baseline, quantileMin = 50, use_residuals = False): #TODO mov
     
     return df_f
 
-def custom_df_f_startend(c, baseline_start, baseline_end, method = 'zscore', use_residuals = False):
+def custom_df_f_startend(c, baseline_start, baseline_end, method='zscore',
+                          use_residuals=False, is_cell=None):
     """
     A custom version of the detrend_df_f function in the original CaImAn code.
     In this version, we compute the baseline fluorescence using only a specified number
     of frames at the beginning of the recording. By setting quantileMin to 50 we effectively
     normalize to the median of the baseline period.
+
+    is_cell : optional bool array (K,) — if provided, only those neurons are used.
     """
     A, C, b, f, YrA = c.estimates.A, c.estimates.C, c.estimates.b, c.estimates.f, c.estimates.YrA
+    if is_cell is not None:
+        A   = A[:, is_cell]
+        C   = C[is_cell]
+        YrA = YrA[is_cell]
     F = C + YrA if use_residuals else C
-    F = F * np.sqrt((A.T @ A).diagonal()[:,None])
+    F = F * np.sqrt((A.T @ A).diagonal()[:, None])
     B = b @ f
-    f0 =  F + (A.T @ B)
+    f0 = F + (A.T @ B)
     if method == 'norm_to_median':
-        f0 = np.percentile(f0[:,baseline_start:baseline_end], 50, axis=1)
-        fb = np.percentile(F[:,baseline_start:baseline_end], 50, axis=1)
+        f0 = np.percentile(f0[:, baseline_start:baseline_end], 50, axis=1)
+        fb = np.percentile(F[:, baseline_start:baseline_end], 50, axis=1)
     elif method == 'zscore':
-        fb = np.mean(F[:,baseline_start:baseline_end], axis=1)
-        f0 = np.std(f0[:,baseline_start:baseline_end], axis=1)
-    df_f = (F - fb[:,None])/f0[:,None]
-    
+        fb = np.mean(F[:, baseline_start:baseline_end], axis=1)
+        f0 = np.std(f0[:, baseline_start:baseline_end], axis=1)
+    df_f = (F - fb[:, None]) / f0[:, None]
+
     return df_f
 
 
@@ -379,6 +393,9 @@ def get_stims_n(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30,
         cnm = cnmf_module.load_CNMF(cnm_file)
         K = cnm.estimates.A.shape[1]
 
+        is_cell = _load_is_cell(cnm_file, z)
+        K_used  = int(is_cell.sum()) if is_cell is not None else K
+
         session_lengths = _session_lengths(provenance, z)
         N = len(session_lengths)
         total_T = sum(session_lengths)
@@ -403,10 +420,11 @@ def get_stims_n(provenance, frame_period=0.585, pre_discard_s=30, baseline_s=30,
 
         for j, w in enumerate(windows):
             fl = custom_df_f_startend(cnm, w['bline_start'], w['bline_end'],
-                                      method='zscore', use_residuals=True)
+                                      method='zscore', use_residuals=True,
+                                      is_cell=is_cell)
             stims_accum[j].append(fl[:, w['bline_start']:w['stim_end']])
 
-        z_ids.extend([int(z.replace('z', ''))] * K)
+        z_ids.extend([int(z.replace('z', ''))] * K_used)
 
     stims_n = [np.vstack(acc) for acc in stims_accum]
     return stims_n, np.array(z_ids)
@@ -516,14 +534,17 @@ def get_region_labels(provenance, subregion_dir):
     for z in provenance['source_extraction'].keys():
         cnm_file = provenance['source_extraction'][z]['filenames']['cnm_file']
         cnm = cnmf_module.load_CNMF(cnm_file)
-        K = cnm.estimates.A.shape[1]
+
+        is_cell = _load_is_cell(cnm_file, z)
+        A_use   = cnm.estimates.A[:, is_cell] if is_cell is not None else cnm.estimates.A
+        K_used  = A_use.shape[1]
 
         sreg_file = Path(subregion_dir) / z / f'subregion_masks_{z}.npy'
         if sreg_file.exists():
-            sreg = np.load(sreg_file)           # shape (2, h, w)
-            centers = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
-            h, w = sreg.shape[1], sreg.shape[2]
-            lbl = np.full(K, -1, dtype=int)
+            sreg    = np.load(sreg_file)           # shape (2, h, w)
+            centers = com(A_use, cnm.estimates.dims[0], cnm.estimates.dims[1])
+            h, w    = sreg.shape[1], sreg.shape[2]
+            lbl     = np.full(K_used, -1, dtype=int)
             for k, (cy, cx) in enumerate(centers):
                 r = min(max(int(round(cy)), 0), h - 1)
                 c = min(max(int(round(cx)), 0), w - 1)
@@ -533,7 +554,7 @@ def get_region_labels(provenance, subregion_dir):
                     lbl[k] = 1
             labels_all.append(lbl)
         else:
-            labels_all.append(np.full(K, -1, dtype=int))
+            labels_all.append(np.full(K_used, -1, dtype=int))
 
     return np.concatenate(labels_all)
 
@@ -567,7 +588,9 @@ def get_spatial_response_data(provenance, frame_period=0.585, pre_discard_s=30,
         mc_imgs_path = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['mc_ch']]
 
         cnm = cnmf_module.load_CNMF(cnm_file)
-        centers = com(cnm.estimates.A, cnm.estimates.dims[0], cnm.estimates.dims[1])
+        is_cell = _load_is_cell(cnm_file, z)
+        A_use   = cnm.estimates.A[:, is_cell] if is_cell is not None else cnm.estimates.A
+        centers = com(A_use, cnm.estimates.dims[0], cnm.estimates.dims[1])
 
         Yr_mc, dims_mc, T_mc = caiman.load_memmap(mc_imgs_path)
         anatomy = np.reshape(Yr_mc.T, [T_mc] + list(dims_mc), order='F').max(axis=0)
@@ -578,8 +601,10 @@ def get_spatial_response_data(provenance, frame_period=0.585, pre_discard_s=30,
         ses1_len = _session_lengths(provenance, z)[0]
         w = _session_window_indices(ses1_len, pre_f, base_f, stim_f)
 
-        fl1 = custom_df_f_startend(cnm, w['bline1_start'], w['bline1_end'], method='zscore', use_residuals=True)
-        fl2 = custom_df_f_startend(cnm, w['bline2_start'], w['bline2_end'], method='zscore', use_residuals=True)
+        fl1 = custom_df_f_startend(cnm, w['bline1_start'], w['bline1_end'],
+                                   method='zscore', use_residuals=True, is_cell=is_cell)
+        fl2 = custom_df_f_startend(cnm, w['bline2_start'], w['bline2_end'],
+                                   method='zscore', use_residuals=True, is_cell=is_cell)
 
         stim1_mdn = np.median(fl1[:, w['stim1_start']:w['stim1_end']], axis=1)
         stim2_mdn = np.median(fl2[:, w['stim2_start']:w['stim2_end']], axis=1)

@@ -82,4 +82,5 @@ dependencies:
       - segment-anything      # required by cellpose 4.x
       - customtkinter>=5.2
       - tkinterhtml
+      - plotly>=5.0           # optional: 3-D neuron reconstruction in multi-plane review
       # After conda env create, run the GPU torch steps in README.
