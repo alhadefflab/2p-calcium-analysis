@@ -793,7 +793,7 @@ class PipelineGUI(ctk.CTk):
 
         return new_masks, roi_masks_file, new_bkg, new_mask_img
 
-    def _neuron_viewer_for_pipeline(self, cnm, mean_img):
+    def _neuron_viewer_for_pipeline(self, cnm, mean_img, provenance=None, z=None):
         """Called from the worker thread. Opens NeuronViewerWindow on the main thread
         and blocks until the user clicks Save & Close."""
         from gui.neuron import Neuron
@@ -802,6 +802,26 @@ class PipelineGUI(ctk.CTk):
         self._log("  Building neuron list from CNMF estimates …")
         neurons = Neuron.build_all(cnm.estimates)   # pure numpy — safe on worker thread
         self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
+
+        # Build timing_info for trace annotations if we have session data
+        timing_info = None
+        if provenance is not None and z is not None:
+            try:
+                from pipeline_funcs import _session_lengths
+                ses_lens = _session_lengths(provenance, z)
+                fp    = getattr(self, '_current_fp',     0.033)
+                pre_s = getattr(self, '_current_pre_s',  30.0)
+                base_s = getattr(self, '_current_base_s', 30.0)
+                stim_s = getattr(self, '_current_stim_s', 180.0)
+                timing_info = dict(
+                    fp=fp,
+                    pre_f=round(pre_s  / fp),
+                    base_f=round(base_s / fp),
+                    stim_f=round(stim_s / fp),
+                    session_lengths=ses_lens,
+                )
+            except Exception as _e:
+                self._log(f"  (timing annotations unavailable: {_e})")
 
         result_holder = [None]
         done = threading.Event()
@@ -816,6 +836,7 @@ class PipelineGUI(ctk.CTk):
                 self, neurons, mean_img,
                 frame_period=getattr(self, '_current_fp', 0.033),
                 on_close=_on_close,
+                timing_info=timing_info,
             )
 
         self.after(0, _show)
@@ -856,7 +877,10 @@ class PipelineGUI(ctk.CTk):
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
                                       p["baseline_s"],   p["stim_s"])
-        self._current_fp = fp   # made available to _neuron_viewer_for_pipeline
+        self._current_fp     = fp      # made available to _neuron_viewer_for_pipeline
+        self._current_pre_s  = pre_s
+        self._current_base_s = base_s
+        self._current_stim_s = stim_s
         threshold = p["threshold"]
         n_stims   = p["n_stims"]
 
@@ -908,10 +932,15 @@ class PipelineGUI(ctk.CTk):
                     self._log(
                         f"  Source extraction ({z}) — "
                         "ROI editor will open in a popup window …")
+                    def _make_viewer_fn(z_name):
+                        def _fn(cnm, img):
+                            return self._neuron_viewer_for_pipeline(
+                                cnm, img, provenance, z_name)
+                        return _fn
                     provenance = source_extraction(
                         provenance, None, z, None,
                         roi_editor_fn=roi_fn,
-                        neuron_viewer_fn=self._neuron_viewer_for_pipeline,
+                        neuron_viewer_fn=_make_viewer_fn(z),
                         idroi_params=cp)
             else:
                 self._log("  Skipping CNMF — using saved results.")
@@ -993,7 +1022,7 @@ class PipelineGUI(ctk.CTk):
                         self._log(f"    {z}: loading CNMF …")
                         cnm = _cnmf_module.load_CNMF(cnm_file)
 
-                        is_cell = self._neuron_viewer_for_pipeline(cnm, func_lc)
+                        is_cell = self._neuron_viewer_for_pipeline(cnm, func_lc, provenance, z)
                         if is_cell is not None:
                             is_cell_file = Path(cnm_file).parent / f'concat_{z}_is_cell.npy'
                             np.save(is_cell_file, is_cell)
