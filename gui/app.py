@@ -597,6 +597,11 @@ class PipelineGUI(ctk.CTk):
             text="Sub-region setup  —  (re)define sub-regions without re-running CNMF")
         self.do_subregion_setup.pack(anchor="w", padx=16, pady=4)
 
+        self.do_neuron_curation = ctk.CTkCheckBox(
+            stages,
+            text="Neuron curation  —  re-open neuron viewer on saved CNMF, accept / reject without re-running")
+        self.do_neuron_curation.pack(anchor="w", padx=16, pady=4)
+
         self.do_analysis = ctk.CTkCheckBox(
             stages,
             text="Stimulus response analysis  —  fast, re-run this after changing timing or threshold")
@@ -788,6 +793,35 @@ class PipelineGUI(ctk.CTk):
 
         return new_masks, roi_masks_file, new_bkg, new_mask_img
 
+    def _neuron_viewer_for_pipeline(self, cnm, mean_img):
+        """Called from the worker thread. Opens NeuronViewerWindow on the main thread
+        and blocks until the user clicks Save & Close."""
+        from gui.neuron import Neuron
+        from gui.neuron_viewer import NeuronViewerWindow
+
+        self._log("  Building neuron list from CNMF estimates …")
+        neurons = Neuron.build_all(cnm.estimates)   # pure numpy — safe on worker thread
+        self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
+
+        result_holder = [None]
+        done = threading.Event()
+
+        def _show():
+            def _on_close(is_cell):
+                n_acc = int(is_cell.sum())
+                result_holder[0] = is_cell
+                self._log(f"  Neuron viewer closed — {n_acc} / {len(neurons)} accepted.")
+                done.set()
+            NeuronViewerWindow(
+                self, neurons, mean_img,
+                frame_period=getattr(self, '_current_fp', 0.033),
+                on_close=_on_close,
+            )
+
+        self.after(0, _show)
+        done.wait()
+        return result_holder[0]
+
     def _run_pipeline(self, p: dict):
         class _StdoutCapture:
             def __init__(self, fn):
@@ -822,6 +856,7 @@ class PipelineGUI(ctk.CTk):
 
         fp, pre_s, base_s, stim_s = (p["frame_period"], p["pre_discard_s"],
                                       p["baseline_s"],   p["stim_s"])
+        self._current_fp = fp   # made available to _neuron_viewer_for_pipeline
         threshold = p["threshold"]
         n_stims   = p["n_stims"]
 
@@ -874,7 +909,9 @@ class PipelineGUI(ctk.CTk):
                         f"  Source extraction ({z}) — "
                         "ROI editor will open in a popup window …")
                     provenance = source_extraction(
-                        provenance, None, z, None, roi_editor_fn=roi_fn,
+                        provenance, None, z, None,
+                        roi_editor_fn=roi_fn,
+                        neuron_viewer_fn=self._neuron_viewer_for_pipeline,
                         idroi_params=cp)
             else:
                 self._log("  Skipping CNMF — using saved results.")
@@ -928,6 +965,42 @@ class PipelineGUI(ctk.CTk):
                             roi_masks, roi_img_bkg, roi_img_mask)
                 except Exception:
                     self._log("  ⚠ Sub-region setup failed:")
+                    self._log(traceback.format_exc())
+
+            if self.do_neuron_curation.get():
+                self._log("  Neuron curation — loading saved CNMF, opening viewer …")
+                try:
+                    import caiman as cm
+                    from caiman.source_extraction.cnmf import cnmf as _cnmf_module
+                    ch_dict = provenance['load_data']['args']['ch_dict']
+                    for z in p["z_planes"]:
+                        se = (provenance.get('source_extraction') or {}).get(z)
+                        if not se:
+                            self._log(f"  ⚠ No CNMF results found for {z} — run CNMF first.")
+                            continue
+                        cnm_file = se['filenames']['cnm_file']
+                        if not Path(cnm_file).exists():
+                            self._log(f"  ⚠ CNMF file not found: {cnm_file}")
+                            continue
+
+                        func_corr_file = provenance['rigid_motion_correction'][z]['filenames'][ch_dict['func_ch']]
+                        if not Path(func_corr_file).is_absolute():
+                            func_corr_file = str(Path(out_dir) / z / Path(func_corr_file).name)
+
+                        self._log(f"    {z}: computing background image …")
+                        func_lc = np.percentile(cm.load(func_corr_file), 99, axis=0)
+
+                        self._log(f"    {z}: loading CNMF …")
+                        cnm = _cnmf_module.load_CNMF(cnm_file)
+
+                        is_cell = self._neuron_viewer_for_pipeline(cnm, func_lc)
+                        if is_cell is not None:
+                            is_cell_file = Path(cnm_file).parent / f'concat_{z}_is_cell.npy'
+                            np.save(is_cell_file, is_cell)
+                            provenance['source_extraction'][z]['filenames']['is_cell_file'] = str(is_cell_file)
+                            _save_provenance(provenance)
+                except Exception:
+                    self._log("  ⚠ Neuron curation failed:")
                     self._log(traceback.format_exc())
 
             if self.do_analysis.get():

@@ -154,20 +154,10 @@ Items marked ✅ have been patched. Items marked ❌ are open.
 
 ### Analysis correctness
 
-- ✅ **Stimulus window index offset** — `get_resp1_resp2` was using original frame numbers (103) as indices into `stims1`, which starts 52 frames into the recording. Classification was silently starting ~30 s late. Fixed by correcting the index to 51 (= 103 − 52) in `pipeline_funcs.py`.
-- ✅ **CNMF component quality control missing** — `evaluate_components` + `select_components` were removed at some point during refactoring. Without them, noise components and neuropil patches passed straight through to classification. Both calls have been restored after `cnm.fit()` in `pipeline.py`.
-- ✅ **`get_resp1_resp2` called with wrong number of arguments** — the per-animal loop was passing 2 arguments to a function that requires 3, crashing immediately on any multi-animal run. Fixed.
-- ✅ **Timing defined in frames instead of seconds** — frame indices were hardcoded as rounded integers. All timing is now computed from seconds via `round(seconds / frame_period)` and exposed in the GUI.
-- ✅ **Pipeline hardcoded for exactly 2 stimuli** — `get_stims1_stims2` and `get_resp1_resp2` assumed exactly two concatenated sessions. Replaced by `get_stims_n` / `get_resp_n` which support 1–4 stimuli. The GUI's **Number of stimuli** selector sets the count globally; old two-stimulus callers remain as thin wrappers for backward compatibility.
 - ❌ **No false discovery rate correction** — responders are classified with a fixed z-score threshold (default 1.64, p < 0.05 one-tailed), applied independently to every neuron. With hundreds of neurons tested simultaneously, expected false positives accumulate. Standard fix is Benjamini–Hochberg FDR correction.
 
 ### Code quality / environment
 
-- ✅ **Video output filename typo** — source extraction video was saved as `conat_…` instead of `concat_…`. Fixed in `pipeline.py`.
-- ✅ **`environment.yml` encoding and prefix** — the original `environment.yml` was saved as UTF-16 LE and contained a hardcoded `prefix:` path. Replaced by `environment-cpu.yml` and `environment-gpu.yml`, both standard UTF-8 with no prefix.
-- ✅ **`analysis_again.py` contains hardcoded subject/path references** — file removed; the GUI replaces this workflow.
-- ✅ **`scratch.py` has dead code** — file removed.
-- ✅ **No unit tests** — unit and regression tests now exist in `tests/`. See [docs/testing.md](docs/testing.md).
 - ❌ **`multi_crop_len` defined but never used** — `params.py` defines `multi_crop_len` but `_load_data` only uses `multi_crop_start`, cropping with no upper bound. If sessions differ in total frame count the output arrays will have inconsistent lengths.
 - ❌ **`_load_data` channel count not validated** — no check that channel counts or frame dimensions match across sessions before concatenation.
 
