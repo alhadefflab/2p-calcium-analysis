@@ -1,5 +1,11 @@
 from pipeline_utils import get_cycle, get_end
 
+try:
+    import torch
+    USE_GPU = torch.cuda.is_available()
+except ImportError:
+    USE_GPU = False
+
 # general config
 CONFIG_PARAMS = {
     "frame_function":  get_cycle, # the function for extracting the frame
@@ -28,7 +34,7 @@ MC_PARAMS = {
     "shifts_opencv": True ,    # flag for correcting motion using bicubic interpolation (otherwise FFT interpolation is used)
     "border_nan"   : 'copy',
     "nonneg_movie" : True,
-    "use_cuda"  : False,
+    "use_cuda"  : USE_GPU,
     "strides"   : (64, 64), # size of patches for nonrigid motion correction in pixels
     "overlaps"  : (32, 32), # number of pixrls of overlap between patches
     "max_deviation_rigid"  : 3, # maximum allowed deviation of any individual patch's registered shift from the rigid shift
@@ -56,11 +62,11 @@ IDROI_PARAMS = {
     "method" :'max', 
     "filt" : True, # whether or not to spatially filter the resulting image
     "kern" : 1,      # kernel size of filter 
-    "channels" : [[0,0]], 
-    "flow_threshold" : 2, 
-    "cellprob_threshold" : -1, 
-    "diameter" : 15, 
-    "model_type" : 'cyto',
+    "flow_threshold" : 2,
+    "cellprob_threshold" : -1,
+    "diameter" : 15,
+    "model_type" : 'cyto3',  # cyto3 is the recommended model in Cellpose 4.x
+    "gpu" : USE_GPU,
     'show_figs' : True   # show figures
 }
 
@@ -74,8 +80,8 @@ CNMF_PARAMS = {
     'rf': None, #must be None for seeded mode
     'only_init':False, #must be false for seeded mode
     'min_SNR': 2.0,
-    'use_cnn': False, # whether or not to use a convolutional neural network to classify rois as good or bad
-    'use_cuda':False, # whether or not to use GPUs
+    'use_cnn': False,    # set True to enable PyTorch CNN quality classifier (requires new CaImAn)
+    'use_cuda': USE_GPU,
 
     ## the rest of these are necessary parameters to set for that get ignored
     ## since we are seeding the algorithm for initialization

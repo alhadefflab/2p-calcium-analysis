@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# Legacy module — preserved from visualizationKB.py; not actively extended.
 
 """ List of plotting functions to visualize what's happening in the code """
 
@@ -22,8 +23,7 @@ import matplotlib.cm as cm
 from matplotlib.widgets import Slider
 import numpy as np
 import pylab as pl
-from scipy.ndimage.measurements import center_of_mass
-from scipy.ndimage.filters import median_filter
+from scipy.ndimage import center_of_mass, median_filter
 from scipy.sparse import issparse, spdiags, coo_matrix, csc_matrix
 from skimage.measure import find_contours
 import sys
@@ -98,7 +98,7 @@ def view_patches(Yr, A, C, b, f, d1, d2, YrA=None, secs=1):
     else:
         Y_r = YrA + C
 
-    A = A.todense()
+    A = A.toarray()
     bkgrnd = np.reshape(b, (d1, d2) + (nb,), order='F')
     fig = pl.figure()
     thismanager = pl.get_current_fig_manager()
@@ -348,7 +348,7 @@ def hv_view_patches(Yr, A, C, b, f, d1, d2, YrA=None, image_neurons=None, denois
         a_norm = (a - a.min()) / (a.max() - a.min())
         return a_norm * (rg[1] - rg[0]) + rg[0]
 
-    Ad = np.asarray(A.todense()).reshape((d1, d2, -1), order='F')
+    Ad = A.toarray().reshape((d1, d2, -1), order='F')
 
     def plot_unit(uid, scl):
         if r_values is not None:

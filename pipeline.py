@@ -1,4 +1,9 @@
-#
+try:
+    import torch as _torch
+    _USE_GPU = _torch.cuda.is_available()
+except ImportError:
+    _USE_GPU = False
+
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
@@ -6,7 +11,7 @@ from pipeline_utils import YAMLDict, capture_args
 from collections import defaultdict, OrderedDict
 from pathlib import Path
 from pipeline_utils import combine_tiffs
-from tifffile import imread, imsave
+from tifffile import imread, imwrite as imsave
 
 import matplotlib.pyplot as plt
 import seaborn as sns 
@@ -322,7 +327,7 @@ def _visualize_rigcorr_results(mc, mc_ch, mc_ch_file, figbasename):
 
 @capture_args
 def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shifts=(50, 50), niter_rig= 3, pw_rigid= True, shifts_opencv=True, border_nan= 'copy',
-                            nonneg_movie=True, use_cuda=False, strides=(64, 64), overlaps=(32, 32), max_deviation_rigid=3,
+                            nonneg_movie=True, use_cuda=_USE_GPU, strides=(64, 64), overlaps=(32, 32), max_deviation_rigid=3,
                             upsample_factor_grid=4, mcvideo_params={}, **kwargs):
     
     """
@@ -373,7 +378,7 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 
 
     _, dview, _ = cm.cluster.setup_cluster(
-            backend='local', n_processes=nprocs, single_thread=False)
+            backend='multiprocessing', n_processes=nprocs, single_thread=False)
 
     #for i, p in enumerate(multi_path):
         #p = os.path.basename(p)
@@ -396,7 +401,9 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
     border_to_0 = 0 if mc.border_nan == 'copy' else mc.border_to_0 
 
     mc_ch_basename = (output_dir / f'concat_{ch_dict["mc_ch"]}_{z}-rigcorr_struct-').as_posix()
-    rigcorr_results_filenames[ch_dict['mc_ch']] = cm.save_memmap(mc.mmap_file, base_name=mc_ch_basename, order='C',
+    # cm.save_memmap requires a list of filenames
+    mmap_file = mc.mmap_file if isinstance(mc.mmap_file, list) else [mc.mmap_file]
+    rigcorr_results_filenames[ch_dict['mc_ch']] = cm.save_memmap(mmap_file, base_name=mc_ch_basename, order='C',
                             border_to_0=border_to_0, dview=dview)
 
     # apply the shifts to the functional channel and save
@@ -405,8 +412,9 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
     # imsave(func_fname, concat_fc)
 
     f_ch_basename = (output_dir / f'concat_{ch_dict["func_ch"]}_{z}-rigcorr_func-').as_posix()
-    rigcorr_results_filenames[ch_dict['func_ch']] = mc.apply_shifts_movie(func_fname, 
-                                                                    save_memmap=True, order = 'C', save_base_name=f_ch_basename)
+    f_ch_mmap = mc.apply_shifts_movie(func_fname, save_memmap=True, order='C', save_base_name=f_ch_basename)
+    # normalize: CaImAn 1.12+ may return a list instead of a string
+    rigcorr_results_filenames[ch_dict['func_ch']] = f_ch_mmap[0] if isinstance(f_ch_mmap, list) else f_ch_mmap
 
     _save_rigid_motion_correction_video(output_dir, ch_dict['func_ch'], rigcorr_results_filenames[ch_dict['func_ch']], z, 'concat', **mcvideo_params)
         
@@ -429,9 +437,9 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 
 
 #
-def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1, 
-                    channels=[[0,0]], flow_threshold=2, cellprob_threshold=-1, diameter=15, 
-                    model_type='cyto', show_figs=True):
+def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
+                    flow_threshold=2, cellprob_threshold=-1, diameter=15,
+                    model_type='cyto3', gpu=_USE_GPU, show_figs=True):
 
     """
     "method" :'max', 
@@ -468,10 +476,10 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
         plt.imshow(func_lc)
 
     ###
-    model = models.Cellpose(model_type=model_type, gpu=False)
-    masks, _, _, _ = model.eval(func_lc,  diameter= diameter, channels=channels, 
-                                flow_threshold = flow_threshold,
-                                cellprob_threshold = cellprob_threshold)
+    model = models.CellposeModel(model_type=model_type, gpu=gpu)
+    masks, _, _ = model.eval(func_lc, diameter=diameter,
+                             flow_threshold=flow_threshold,
+                             cellprob_threshold=cellprob_threshold)
     
     roi_masks = np.array([(masks==i).flatten('F') for i in np.sort(np.unique(masks))[1:]]).T
 
@@ -548,9 +556,9 @@ def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_
 
  
 
-def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2, 
-            rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=False, 
-            K=300,  gSig=[10,10]):
+def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
+            rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=_USE_GPU,
+            K=300, gSig=[10,10]):
 
 
     """
@@ -582,26 +590,25 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
 
 
     _, dview, n_processes = cm.cluster.setup_cluster(
-        backend='local', n_processes=None, single_thread=False)
+        backend='multiprocessing', n_processes=None, single_thread=False)
 
 
     # do an initial fit of the cnmf
     cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
-    
+
     Yr, dims, T = cm.load_memmap(func_ch_file)
     f_ch_rigcorr = np.reshape(Yr.T, [T] + list(dims), order='F')
 
-    cnm = cnm.fit(f_ch_rigcorr)
+    cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
 
     cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
     cnm.estimates.select_components(use_object=True)
 
-    # save
-    cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
-    cnm.save(cnmf_file.as_posix()) 
-
     cm.stop_server(dview=dview)
-    #cnm.dview=None
+    cnm.dview = None  # must be None before save so file is marked correctly
+
+    cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
+    cnm.save(cnmf_file.as_posix())
 
     return cnm, cnmf_file
 
@@ -642,7 +649,7 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
 
 
     #_, dview, _ = cm.cluster.setup_cluster(
-    #        backend='local', n_processes=None, single_thread=False)
+    #        backend='multiprocessing', n_processes=None, single_thread=False)
     #mc.dview = dview
 
     prov = provenance['load_data']['args']
