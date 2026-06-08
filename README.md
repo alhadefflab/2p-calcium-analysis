@@ -100,7 +100,19 @@ After activating either environment, GPU usage is **automatic**: `params.py` cal
 
 **Key dependencies:** CaImAn >= 1.12, Cellpose >= 4, PyTorch >= 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
 
-**Optional:** plotly >= 5.0, required for the 3-D neuron reconstruction view in Multi-plane Duplicate Review. Included in both conda environment files. Install manually if needed: `pip install plotly`
+**Optional packages** — all included in the conda environment files and installed automatically on fresh `conda env create`. If you already have an existing environment, install them manually with:
+
+```
+pip install plotly ripser pyvista
+```
+
+| Package | Used by | Behaviour if absent |
+|---------|---------|---------------------|
+| `plotly` | Multi-plane 3-D neuron reconstruction; Manifold activation animation | Button disabled, message shown |
+| `ripser` | Population Analysis → Topology tab → persistent homology (TDA) | TDA checkbox disabled |
+| `pyvista` | Neural Manifold Analysis → Neuron Explorer → 3-D spatial map | Button disabled, message shown |
+
+The core analyses (clustering, state-space trajectories, coding dimensions, subspaces) run without any of these packages.
 
 ## Usage
 

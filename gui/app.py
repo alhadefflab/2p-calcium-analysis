@@ -1,5 +1,6 @@
 """
-Luceo — 2P Calcium Imaging Pipeline
+Luceo
+2P Calcium Imaging Pipeline
 Run:  python gui.py
 Requires: pip install customtkinter
 """
@@ -198,7 +199,7 @@ class PipelineGUI(ctk.CTk):
             row=2, column=0, pady=5, sticky="w")
         self.analysis_out_var = ctk.StringVar()
         ctk.CTkEntry(top, textvariable=self.analysis_out_var, width=320,
-                     placeholder_text="Default: <project folder>/analysis/  — override here if needed").grid(
+                     placeholder_text="Default: <project folder>/analysis/ override here if needed").grid(
             row=2, column=1, padx=8, sticky="w")
         ctk.CTkButton(top, text="Browse", width=80,
                       command=self._browse_analysis_out).grid(row=2, column=2, padx=4)
@@ -375,11 +376,11 @@ class PipelineGUI(ctk.CTk):
 
         if parts:
             self.prov_label.configure(
-                text=f"  Existing project found — {',  '.join(parts)}",
+                text=f"  Existing project found - {',  '.join(parts)}",
                 text_color="#5cb85c")
         else:
             self.prov_label.configure(
-                text="  No existing project found at this location — will start fresh.",
+                text="  No existing project found at this location, will start fresh.",
                 text_color="gray")
 
     # ── tab 2: recording ───────────────────────────────────────────────────
@@ -433,7 +434,7 @@ class PipelineGUI(ctk.CTk):
         self.cp_flow_var          = ctk.StringVar(value="2.0")
         self.cp_cellprob_var      = ctk.StringVar(value="-1.0")
 
-        # Cell diameter row — manual entry + Auto toggle
+        # Cell diameter row,  manual entry + Auto toggle
         drow = ctk.CTkFrame(tab, fg_color="transparent")
         drow.pack(fill="x", padx=22, pady=9)
         ctk.CTkLabel(drow, text="Cell diameter  (px):", width=220, anchor="w").pack(side="left")
@@ -449,9 +450,9 @@ class PipelineGUI(ctk.CTk):
                      text="Auto = let Cellpose estimate  |  or enter a fixed px value",
                      text_color="gray").pack(side="left")
         field("Flow threshold:",               self.cp_flow_var,
-              "shape strictness — lower = stricter  (Cellpose default: 0.4;  current: 2.0 = permissive)")
+              "shape strictness - lower = stricter  (Cellpose default: 0.4;  current: 2.0 = permissive)")
         field("Cell probability threshold:",   self.cp_cellprob_var,
-              "detection sensitivity — lower = more cells  (Cellpose default: 0.0;  current: −1.0)")
+              "detection sensitivity - lower = more cells  (Cellpose default: 0.0;  current: −1.0)")
 
         self._refresh()
 
@@ -484,7 +485,7 @@ class PipelineGUI(ctk.CTk):
             messagebox.showinfo("Auto-detect", f"Found: {', '.join(zs)}")
         else:
             messagebox.showwarning("Auto-detect",
-                                   "No z-planes detected — check the folder contains Bruker TIFFs.")
+                                   "No z-planes detected - check the folder contains Bruker TIFFs.")
 
     # ── tab 3: timing ──────────────────────────────────────────────────────
 
@@ -565,7 +566,7 @@ class PipelineGUI(ctk.CTk):
                 f"  baseline  frames  {pf} – {pf+bf-1}      ({bf} frames,  ~{bl:.0f} s)\n"
                 f"  stimulus  frames  {pf+bf} – {pf+bf+sf-1}   ({sf} frames,  ~{st:.0f} s)\n\n"
                 f"  Expected per session: {se} frames  ({pf} + {bf} + {sf})\n"
-                f"  Actual count read from recording — mismatch shown in run log."
+                f"  Actual count read from recording - mismatch shown in run log."
             ))
 
     # ── tab 4: run ─────────────────────────────────────────────────────────
@@ -582,41 +583,62 @@ class PipelineGUI(ctk.CTk):
 
         self.do_mc = ctk.CTkCheckBox(
             stages,
-            text="Motion correction  —  slow, reads raw TIFFs, skip if already done")
+            text="Motion correction, slow, reads raw TIFFs, skip if already done")
         self.do_mc.pack(anchor="w", padx=16, pady=4)
         self.do_mc.select()
 
         self.do_cnmf = ctk.CTkCheckBox(
             stages,
-            text="Source extraction / CNMF  —  slow, opens interactive ROI editor, skip if already done")
+            text="Source extraction / CNMF,  slow, opens interactive ROI editor, skip if already done")
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
         self.do_subregion_setup = ctk.CTkCheckBox(
             stages,
-            text="Sub-region setup  —  (re)define sub-regions without re-running CNMF")
+            text="Sub-region setup,  (re)define sub-regions without re-running CNMF")
         self.do_subregion_setup.pack(anchor="w", padx=16, pady=4)
 
         self.do_neuron_curation = ctk.CTkCheckBox(
             stages,
-            text="Neuron curation  —  re-open neuron viewer on saved CNMF, accept / reject without re-running")
+            text="Neuron curation,  re-open neuron viewer on saved CNMF, accept / reject without re-running")
         self.do_neuron_curation.pack(anchor="w", padx=16, pady=4)
 
         self.do_multiplane_review = ctk.CTkCheckBox(
             stages,
-            text="Multi-plane duplicate review  —  3-D map across z-planes, detect and resolve duplicate neurons  (2+ planes)")
+            text="Multi-plane duplicate review, 3-D map across z-planes, detect and resolve duplicate neurons  (2+ planes)")
         self.do_multiplane_review.pack(anchor="w", padx=16, pady=4)
 
         self.do_analysis = ctk.CTkCheckBox(
             stages,
-            text="Stimulus response analysis  —  fast, re-run this after changing timing or threshold")
+            text="Stimulus response analysis,  fast, re-run this after changing timing or threshold")
         self.do_analysis.pack(anchor="w", padx=16, pady=4)
         self.do_analysis.select()
 
         self.do_subregion = ctk.CTkCheckBox(
             stages,
-            text="Sub-region analysis  —  optional, requires regions defined in the ROI editor")
-        self.do_subregion.pack(anchor="w", padx=(4, 10), pady=(4, 10))
+            text="Sub-region analysis,  optional, requires regions defined in the ROI editor")
+        self.do_subregion.pack(anchor="w", padx=16, pady=4)
+
+        self.do_population = ctk.CTkCheckBox(
+            stages,
+            text="Co-activity clustering  (work in progress),  Sherringtonian view: group "
+                 "individual neurons into functional types (K-Means / GMM / Hierarchical)")
+        self.do_population.pack(anchor="w", padx=16, pady=4)
+
+        self.do_manifold = ctk.CTkCheckBox(
+            stages,
+            text="Neural manifold analysis  (work in progress),  Hopfieldian view: population "
+                 "state space,  coding dimensions, states / attractors, topology  (Ebitz & Hayden 2021)")
+        self.do_manifold.pack(anchor="w", padx=16, pady=4)
+
+        def _sync_analysis_dependent():
+            state = "normal" if self.do_analysis.get() else "disabled"
+            for cb in (self.do_population, self.do_manifold):
+                cb.configure(state=state)
+                if state == "disabled":
+                    cb.deselect()
+
+        self.do_analysis.configure(command=_sync_analysis_dependent)
 
         ctk.CTkLabel(tab,
                      text="Tip: to iterate on timing parameters, uncheck the first two and only re-run analysis.\n"
@@ -756,13 +778,13 @@ class PipelineGUI(ctk.CTk):
                 if (mc_h, mc_w) != (func_h, func_w):
                     self._log(
                         f"  MC channel dims {(mc_h, mc_w)} differ from functional "
-                        f"{(func_h, func_w)} — resizing MC background to match.")
+                        f"{(func_h, func_w)},  resizing MC background to match.")
                     mc_gray = np.array(
                         _PILImg.fromarray(mc_gray).resize(
                             (func_w, func_h), _PILImg.BILINEAR))
                 else:
                     self._log(
-                        f"  MC background dims match functional ({func_h}×{func_w}) — no resize needed.")
+                        f"  MC background dims match functional ({func_h}×{func_w}), no resize needed.")
                 mc_img_bkg = cv.cvtColor(mc_gray, cv.COLOR_GRAY2RGB)
         except Exception as _e:
             self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
@@ -805,7 +827,7 @@ class PipelineGUI(ctk.CTk):
         from gui.neuron_viewer import NeuronViewerWindow
 
         self._log("  Building neuron list from CNMF estimates …")
-        neurons = Neuron.build_all(cnm.estimates)   # pure numpy — safe on worker thread
+        neurons = Neuron.build_all(cnm.estimates)   # pure numpy, safe on worker thread
         self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
 
         # Build timing_info for trace annotations if we have session data
@@ -835,7 +857,7 @@ class PipelineGUI(ctk.CTk):
             def _on_close(is_cell):
                 n_acc = int(is_cell.sum())
                 result_holder[0] = is_cell
-                self._log(f"  Neuron viewer closed — {n_acc} / {len(neurons)} accepted.")
+                self._log(f"  Neuron viewer closed,  {n_acc} / {len(neurons)} accepted.")
                 done.set()
             NeuronViewerWindow(
                 self, neurons, mean_img,
@@ -861,7 +883,7 @@ class PipelineGUI(ctk.CTk):
         for z in z_planes:
             se = (provenance.get('source_extraction') or {}).get(z)
             if not se:
-                self._log(f"  ⚠ No CNMF results for {z} — skipping.")
+                self._log(f"  ⚠ No CNMF results for {z},  skipping.")
                 continue
             cnm_file = se['filenames']['cnm_file']
             if not Path(cnm_file).exists():
@@ -884,7 +906,7 @@ class PipelineGUI(ctk.CTk):
                 z=z, neurons=neurons, is_cell=is_cell, mean_image=func_lc))
 
         if len(plane_data) < 2:
-            self._log("  Multi-plane review needs at least 2 z-planes with CNMF — skipping.")
+            self._log("  Multi-plane review needs at least 2 z-planes with CNMF,  skipping.")
             return {}
 
         result_holder = [None]
@@ -975,19 +997,19 @@ class PipelineGUI(ctk.CTk):
                     provenance, _ = rigid_motion_correction(
                         provenance, z, affcorr)
             else:
-                self._log("  Skipping motion correction — loading saved provenance.")
+                self._log("  Skipping motion correction,  loading saved provenance.")
                 provenance = _get_provenance(out_dir)
 
             if self.do_cnmf.get():
                 roi_fn = self._roi_editor_for_pipeline
                 cp = p["cellpose"]
                 self._log(
-                    f"  Cellpose params — diameter: {cp['diameter']}  "
+                    f"  Cellpose params,  diameter: {cp['diameter']}  "
                     f"flow_threshold: {cp['flow_threshold']}  "
                     f"cellprob_threshold: {cp['cellprob_threshold']}")
                 for z in p["z_planes"]:
                     self._log(
-                        f"  Source extraction ({z}) — "
+                        f"  Source extraction ({z}),  "
                         "ROI editor will open in a popup window …")
                     def _make_viewer_fn(z_name):
                         def _fn(cnm, img):
@@ -1000,10 +1022,10 @@ class PipelineGUI(ctk.CTk):
                         neuron_viewer_fn=_make_viewer_fn(z),
                         idroi_params=cp)
             else:
-                self._log("  Skipping CNMF — using saved results.")
+                self._log("  Skipping CNMF,  using saved results.")
 
             if self.do_subregion_setup.get():
-                self._log("  Sub-region setup — ROI editor will open for sub-region definition …")
+                self._log("  Sub-region setup, ROI editor will open for sub-region definition …")
                 try:
                     import caiman as cm
                     import cv2 as _cv2
@@ -1011,7 +1033,7 @@ class PipelineGUI(ctk.CTk):
                     for z in p["z_planes"]:
                         se = (provenance.get('source_extraction') or {}).get(z)
                         if not se:
-                            self._log(f"  ⚠ No CNMF results found for {z} — run CNMF first.")
+                            self._log(f"  ⚠ No CNMF results found for {z},  run CNMF first.")
                             continue
                         roi_masks_file = se['filenames']['roi_masks_file']
                         if not Path(roi_masks_file).is_absolute():
@@ -1054,7 +1076,7 @@ class PipelineGUI(ctk.CTk):
                     self._log(traceback.format_exc())
 
             if self.do_neuron_curation.get():
-                self._log("  Neuron curation — loading saved CNMF, opening viewer …")
+                self._log("  Neuron curation,  loading saved CNMF, opening viewer …")
                 try:
                     import caiman as cm
                     from caiman.source_extraction.cnmf import cnmf as _cnmf_module
@@ -1062,7 +1084,7 @@ class PipelineGUI(ctk.CTk):
                     for z in p["z_planes"]:
                         se = (provenance.get('source_extraction') or {}).get(z)
                         if not se:
-                            self._log(f"  ⚠ No CNMF results found for {z} — run CNMF first.")
+                            self._log(f"  ⚠ No CNMF results found for {z}, run CNMF first.")
                             continue
                         cnm_file = se['filenames']['cnm_file']
                         if not Path(cnm_file).exists():
@@ -1091,9 +1113,9 @@ class PipelineGUI(ctk.CTk):
 
             if self.do_multiplane_review.get():
                 if len(p["z_planes"]) < 2:
-                    self._log("  Multi-plane review skipped — only one z-plane configured.")
+                    self._log("  Multi-plane review skipped,  only one z-plane configured.")
                 else:
-                    self._log("  Multi-plane duplicate review — loading all z-planes …")
+                    self._log("  Multi-plane duplicate review, loading all z-planes …")
                     try:
                         updated = self._multiplane_viewer_for_pipeline(
                             provenance, p["z_planes"])
@@ -1142,7 +1164,7 @@ class PipelineGUI(ctk.CTk):
                 )
                 _save_provenance(provenance)
 
-                # Accumulate per-animal stims — each is a list of N arrays
+                # Accumulate per-animal stims,  each is a list of N arrays
                 _all_stims_n.append(stims_n)
                 _z_ids.append(z_ids)
                 self._log("  Building spatial response data …")
@@ -1158,7 +1180,7 @@ class PipelineGUI(ctk.CTk):
                     )
                     if not found_any:
                         self._log(
-                            "  ⚠ No subregion_masks_*.npy files found — expected at:\n"
+                            "  ⚠ No subregion_masks_*.npy files found,  expected at:\n"
                             + "\n".join(
                                 f"      {Path(out_dir) / z / f'subregion_masks_{z}.npy'}"
                                 for z in p["z_planes"])
@@ -1178,13 +1200,14 @@ class PipelineGUI(ctk.CTk):
                         )
                         if n_a == 0 and n_b == 0:
                             self._log(
-                                "  ⚠ All neurons are unclassified — check that the\n"
+                                "  ⚠ All neurons are unclassified,  check that the\n"
                                 "    sub-region polygons cover the neurons on the canvas."
                             )
                 else:
                     _all_region_labels.append(np.full(stims_n[0].shape[0], -1, dtype=int))
 
-        if not (self.do_analysis.get() and _all_stims_n):
+        if not ((self.do_analysis.get() or self.do_population.get() or
+                 self.do_manifold.get()) and _all_stims_n):
             self._log("\nDone.")
             return
 
@@ -1198,84 +1221,145 @@ class PipelineGUI(ctk.CTk):
         ]
         z_ids_all = np.concatenate(_z_ids)
 
-        resp_n, nums, group_sizes, z_ids_resp = get_resp_n(
-            combined_stims_n, z_ids_all,
-            stim_onset_idx=stim_onset_idx,
-            threshold=threshold,
-        )
-
-        n_total = resp_n[0].shape[0]
-        if N == 2:
-            self._log(
-                f"Stim-1 only: {nums[0]}   Both: {nums[1]}   Stim-2 only: {nums[2]}   "
-                f"Total responsive: {n_total} / {combined_stims_n[0].shape[0]}"
-            )
-        else:
-            parts = "   ".join(
-                f"Stim-{j+1} resp: {nums[j]}" for j in range(N))
-            self._log(
-                f"{parts}   "
-                f"Total responsive (unique): {n_total} / {combined_stims_n[0].shape[0]}"
-            )
+        # Extract centroids aligned with combined_stims_n (for manifold viewer)
+        manifold_centroids = None
+        if _all_spatial:
+            try:
+                all_centers = [zd['centers'] for _, sd in _all_spatial
+                               for zd in sd if zd.get('centers') is not None]
+                if all_centers:
+                    manifold_centroids = np.vstack(all_centers)  # (K_total, 2)
+            except Exception:
+                pass
 
         stim_names = [f"Stimulus {j + 1}" for j in range(N)]
 
         out_dir = str(Path(p["output"]) / p["subject"])
         results_parent = p["analysis_out"] if p["analysis_out"] else out_dir
-        results_dir = self._save_results(
-            results_parent, resp_n, nums, z_ids_resp, group_sizes, p,
-            stim_onset_idx, d["ses_f"])
-        self._log(f"Results saved to  {results_dir}")
+        # Derive results_dir path (same as _save_results would return)
+        results_dir = str(Path(results_parent) / "analysis")
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
 
-        self._log("Opening figures …")
-        self.after(0, lambda: show_plots(
-            resp_n, nums, group_sizes,
-            stim_onset_idx, d["ses_f"],
-            fp, pre_s, stim_s, results_dir,
-            stim_names=stim_names))
+        if self.do_analysis.get():
+            resp_n, nums, group_sizes, z_ids_resp = get_resp_n(
+                combined_stims_n, z_ids_all,
+                stim_onset_idx=stim_onset_idx,
+                threshold=threshold,
+            )
 
-        for _lbl, _sd in _all_spatial:
-            self.after(0, lambda lbl=_lbl, sd=_sd: show_spatial_response_map(
-                lbl, sd, threshold, results_dir))
-
-        # optional sub-region analysis
-        if self.do_subregion.get() and _all_region_labels:
-            region_labels_all = np.concatenate(_all_region_labels)
-            region_results = {}
-            for reg_idx, reg_name in [(0, "Region A"), (1, "Region B")]:
-                mask = region_labels_all == reg_idx
-                n_total_r = int(mask.sum())
-                if n_total_r == 0:
-                    continue
-                stims_region = [s[mask] for s in combined_stims_n]
-                r_n, nums_r, gsizes_r, _ = get_resp_n(
-                    stims_region, z_ids_all[mask],
-                    stim_onset_idx=stim_onset_idx,
-                    threshold=threshold,
+            n_total = resp_n[0].shape[0]
+            if N == 2:
+                self._log(
+                    f"Stim-1 only: {nums[0]}   Both: {nums[1]}   Stim-2 only: {nums[2]}   "
+                    f"Total responsive: {n_total} / {combined_stims_n[0].shape[0]}"
                 )
-                region_results[reg_name] = {
-                    'resp_n': r_n, 'nums': nums_r,
-                    'group_sizes': gsizes_r, 'n_total': n_total_r,
-                }
-                if N == 2:
-                    self._log(
-                        f"{reg_name} — total: {n_total_r}  "
-                        f"stim1-only: {nums_r[0]}  both: {nums_r[1]}  stim2-only: {nums_r[2]}"
-                    )
-                else:
-                    parts = "   ".join(
-                        f"stim{j+1} resp: {nums_r[j]}" for j in range(N))
-                    self._log(f"{reg_name} — total: {n_total_r}  {parts}")
-
-            if region_results:
-                self._log(
-                    f"  Opening sub-region figures for: {', '.join(region_results.keys())}")
-                self.after(0, lambda rr=region_results: show_region_plots(
-                    rr, stim_onset_idx, d["ses_f"], fp, pre_s, stim_s, results_dir,
-                    stim_names=stim_names))
             else:
+                parts = "   ".join(
+                    f"Stim-{j+1} resp: {nums[j]}" for j in range(N))
                 self._log(
-                    "  ⚠ Sub-region plots skipped — no neurons were classified into any region.")
+                    f"{parts}   "
+                    f"Total responsive (unique): {n_total} / {combined_stims_n[0].shape[0]}"
+                )
+
+            results_dir = self._save_results(
+                results_parent, resp_n, nums, z_ids_resp, group_sizes, p,
+                stim_onset_idx, d["ses_f"])
+            self._log(f"Results saved to  {results_dir}")
+
+            self._log("Opening figures …")
+            self.after(0, lambda: show_plots(
+                resp_n, nums, group_sizes,
+                stim_onset_idx, d["ses_f"],
+                fp, pre_s, stim_s, results_dir,
+                stim_names=stim_names))
+
+            for _lbl, _sd in _all_spatial:
+                self.after(0, lambda lbl=_lbl, sd=_sd: show_spatial_response_map(
+                    lbl, sd, threshold, results_dir))
+
+            # optional sub-region analysis
+            if self.do_subregion.get() and _all_region_labels:
+                region_labels_all = np.concatenate(_all_region_labels)
+                region_results = {}
+                for reg_idx, reg_name in [(0, "Region A"), (1, "Region B")]:
+                    mask = region_labels_all == reg_idx
+                    n_total_r = int(mask.sum())
+                    if n_total_r == 0:
+                        continue
+                    stims_region = [s[mask] for s in combined_stims_n]
+                    r_n, nums_r, gsizes_r, _ = get_resp_n(
+                        stims_region, z_ids_all[mask],
+                        stim_onset_idx=stim_onset_idx,
+                        threshold=threshold,
+                    )
+                    region_results[reg_name] = {
+                        'resp_n': r_n, 'nums': nums_r,
+                        'group_sizes': gsizes_r, 'n_total': n_total_r,
+                    }
+                    if N == 2:
+                        self._log(
+                            f"{reg_name} — total: {n_total_r}  "
+                            f"stim1-only: {nums_r[0]}  both: {nums_r[1]}  stim2-only: {nums_r[2]}"
+                        )
+                    else:
+                        parts = "   ".join(
+                            f"stim{j+1} resp: {nums_r[j]}" for j in range(N))
+                        self._log(f"{reg_name} — total: {n_total_r}  {parts}")
+
+                if region_results:
+                    self._log(
+                        f"  Opening sub-region figures for: {', '.join(region_results.keys())}")
+                    self.after(0, lambda rr=region_results: show_region_plots(
+                        rr, stim_onset_idx, d["ses_f"], fp, pre_s, stim_s, results_dir,
+                        stim_names=stim_names))
+                else:
+                    self._log(
+                        "  ⚠ Sub-region plots skipped, no neurons were classified into any region.")
+
+        # ── population analysis (optional) ────────────────────────────────────
+        if self.do_population.get() and combined_stims_n:
+            self._log("  Running population analysis …")
+            from analysis.population import run_population_analysis
+            from gui.population_viewer import PopulationViewerWindow
+            import traceback as _tb
+            try:
+                pop_results = run_population_analysis(
+                    combined_stims_n,
+                    stim_onset_idx=stim_onset_idx,
+                    results_dir=results_dir,
+                    fp=fp,
+                    stim_names=stim_names,
+                    centroids=manifold_centroids,
+                    z_ids=z_ids_all,
+                )
+                self.after(0, lambda r=pop_results: PopulationViewerWindow(
+                    self, r, results_dir))
+                self._log("  Population viewer opened.")
+            except Exception:
+                self._log("  Population analysis failed:")
+                self._log(_tb.format_exc())
+
+        # ── neural manifold analysis (optional) ───────────────────────────────
+        if self.do_manifold.get() and combined_stims_n:
+            self._log("  Running neural manifold analysis …")
+            from analysis.manifold import run_manifold_analysis
+            from gui.manifold_viewer import ManifoldViewerWindow
+            import traceback as _tb_mfld
+            try:
+                mfld_results = run_manifold_analysis(
+                    combined_stims_n,
+                    stim_onset_idx=stim_onset_idx,
+                    results_dir=results_dir,
+                    fp=fp,
+                    stim_names=stim_names,
+                    centroids=manifold_centroids,
+                )
+                mfld_results["z_ids_all"] = z_ids_all
+                self.after(0, lambda r=mfld_results: ManifoldViewerWindow(self, r))
+                self._log("  Manifold viewer opened.")
+            except Exception:
+                self._log("  Manifold analysis failed:")
+                self._log(_tb_mfld.format_exc())
 
         self._log("Done.")
 

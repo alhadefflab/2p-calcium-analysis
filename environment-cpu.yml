@@ -84,3 +84,5 @@ dependencies:
       - customtkinter>=5.2
       - tkinterhtml
       - plotly>=5.0           # optional: 3-D neuron reconstruction in multi-plane review
+      - ripser                 # optional: persistent homology / TDA in population analysis
+      - pyvista                # optional: 3-D neuron spatial map in manifold viewer
