@@ -1,4 +1,4 @@
-name: caiman-gpu
+name: luceo-gpu
 channels:
   - conda-forge
   - defaults
