@@ -2,8 +2,6 @@
 
 Analysis pipeline for two-photon calcium imaging data. Processes multi-session, multi-Z-plane recordings through motion correction, ROI segmentation, and neural signal extraction.
 
-> **Note:** This codebase is under active development and contains known bugs. Use with caution and expect rough edges.
-
 ## Overview
 
 The pipeline takes raw multi-channel `.tif` stacks from two-photon microscopy sessions and produces denoised, motion-corrected fluorescence traces per neuron across Z-planes.
@@ -17,9 +15,10 @@ The pipeline takes raw multi-channel `.tif` stacks from two-photon microscopy se
 6. **Neuron curation**: post-CNMF interactive browser (`gui/neuron_viewer.py`); inspect individual fluorescence traces and calcium mini-video; accept or reject components; saves `is_cell` mask per z-plane without re-running CNMF
 7. **Multi-plane duplicate review**: cross-z-plane duplicate detection using Jaccard IoU of spatial masks and trace correlation 3-D neuron reconstruction via plotly; interactive resolution per pair; see `docs/multiplane_duplicate_review.md`
 8. **Analysis & visualization**: stimulus-aligned response analysis (`pipeline_funcs.py`) and plots via matplotlib (`visualization/response_plots.py`); `is_cell` masks from curation and duplicate review are applied automatically
-9. **GUI**: `gui.py` is the recommended entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1-4 stimulus conditions. See **Usage** below.
+9. **GUI**: `gui.py` is the only entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1-4 stimulus conditions. See **Usage** below.
 
-Provenance is tracked automatically in a `provenance.yaml` file so each processing step can be skipped on re-runs if outputs already exist.
+Provenance is tracked automatically in a `provenance.yaml` file so each processing step can be skipped on re-runs if outputs already exist. The most time-consuming step by far is **TIFF extraction** (converting raw imaging data into per-plane TIFF stacks); once completed, there is no need to run it again for future analysis in the same dataset using different parameters
+as long as the files are present.
 
 ## File Structure
 
@@ -43,7 +42,12 @@ environment-gpu.yml            # Conda environment (CUDA/GPU)
 
 ## Setup
 
-Choose the environment that matches your hardware (Anaconda Prompt):
+Open **Anaconda Prompt** (or **Miniconda Prompt**) and choose **one** of the two environments below based on your hardware:
+
+- **CPU**: works on any machine; simpler setup; slower on large datasets.
+- **GPU (CUDA)**: requires an NVIDIA GPU with CUDA 12.4 support.
+
+> **If you are using the CPU environment, follow only the CPU section and stop there. Do not follow the GPU steps.**
 
 ---
 
@@ -51,7 +55,10 @@ Choose the environment that matches your hardware (Anaconda Prompt):
 
 ```
 conda env create -f environment-cpu.yml
-conda activate caiman-cpu
+```
+and then:
+```
+conda activate luceo-cpu
 ```
 
 ---
@@ -74,7 +81,10 @@ nvcc --version
 
 ```
 conda env create -f environment-gpu.yml
-conda activate caiman-gpu
+```
+and then:
+```
+conda activate luceo-gpu
 ```
 
 **Step 3: Install GPU-enabled PyTorch**
@@ -89,6 +99,9 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ```
 python -c "import torch; print(torch.cuda.is_available())"
+```
+followed by:
+```
 python -c "import caiman; print(caiman.__version__)"
 ```
 
@@ -99,20 +112,6 @@ Both should succeed without errors.
 After activating either environment, GPU usage is **automatic**: `params.py` calls `torch.cuda.is_available()` at import time and sets `USE_GPU` accordingly. No manual editing required. If you need to force CPU mode (e.g. to test without a GPU), open `params.py` and hardcode `USE_GPU = False`.
 
 **Key dependencies:** CaImAn >= 1.12, Cellpose >= 4, PyTorch >= 2.5, pystackreg, OpenCV, Bokeh, tifffile, NumPy, SciPy
-
-**Optional packages** — all included in the conda environment files and installed automatically on fresh `conda env create`. If you already have an existing environment, install them manually with:
-
-```
-pip install plotly ripser pyvista
-```
-
-| Package | Used by | Behaviour if absent |
-|---------|---------|---------------------|
-| `plotly` | Multi-plane 3-D neuron reconstruction; Manifold activation animation | Button disabled, message shown |
-| `ripser` | Population Analysis → Topology tab → persistent homology (TDA) | TDA checkbox disabled |
-| `pyvista` | Neural Manifold Analysis → Neuron Explorer → 3-D spatial map | Button disabled, message shown |
-
-The core analyses (clustering, state-space trajectories, coding dimensions, subspaces) run without any of these packages.
 
 ## Usage
 

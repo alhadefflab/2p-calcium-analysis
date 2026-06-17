@@ -1,4 +1,4 @@
-name: caiman-cpu
+name: luceo-cpu
 channels:
   - pytorch
   - conda-forge
