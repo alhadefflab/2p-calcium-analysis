@@ -15,9 +15,17 @@ class Neuron:
     accepted: bool = True
 
     @classmethod
-    def from_cnmf(cls, estimates, k: int) -> 'Neuron':
-        """Build a Neuron from column k of a CaImAn CNMF estimates object."""
-        dims = estimates.dims   # (d1, d2) == (height, width)
+    def from_cnmf(cls, estimates, k: int, dims=None) -> 'Neuron':
+        """Build a Neuron from column k of a CaImAn CNMF estimates object.
+
+        ``dims`` is the 2-D ``(height, width)`` field-of-view shape. Pass
+        ``cnm.dims`` explicitly: a freshly fit CNMF object leaves
+        ``estimates.dims`` as ``None`` (CaImAn only back-fills it in
+        ``load_CNMF``), which would reshape the footprint to 1-D and break
+        ``np.where`` below.
+        """
+        if dims is None:
+            dims = estimates.dims   # fallback (set on objects loaded via load_CNMF)
         col = estimates.A[:, k]
         if issparse(col):
             col = np.asarray(col.todense()).ravel()
@@ -46,7 +54,11 @@ class Neuron:
         )
 
     @classmethod
-    def build_all(cls, estimates) -> list['Neuron']:
-        """Build one Neuron per accepted component in a CNMF estimates object."""
+    def build_all(cls, estimates, dims=None) -> list['Neuron']:
+        """Build one Neuron per accepted component in a CNMF estimates object.
+
+        Pass ``cnm.dims`` as ``dims`` for objects straight from ``cnm.fit()``;
+        ``estimates.dims`` alone is unreliable there (see ``from_cnmf``).
+        """
         K = estimates.A.shape[1]
-        return [cls.from_cnmf(estimates, k) for k in range(K)]
+        return [cls.from_cnmf(estimates, k, dims=dims) for k in range(K)]

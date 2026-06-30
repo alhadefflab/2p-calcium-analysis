@@ -5,7 +5,7 @@
 Activate the conda environment before running any tests:
 
 ```
-conda activate caiman
+conda activate luceo
 ```
 
 ## Running unit tests

@@ -827,7 +827,7 @@ class PipelineGUI(ctk.CTk):
         from gui.neuron_viewer import NeuronViewerWindow
 
         self._log("  Building neuron list from CNMF estimates …")
-        neurons = Neuron.build_all(cnm.estimates)   # pure numpy, safe on worker thread
+        neurons = Neuron.build_all(cnm.estimates, dims=cnm.dims)   # pure numpy, safe on worker thread
         self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
 
         # Build timing_info for trace annotations if we have session data
@@ -896,7 +896,7 @@ class PipelineGUI(ctk.CTk):
 
             self._log(f"  Loading {z} …")
             cnm      = _cnmf_module.load_CNMF(cnm_file)
-            neurons  = Neuron.build_all(cnm.estimates)
+            neurons  = Neuron.build_all(cnm.estimates, dims=cnm.dims)
             is_cell  = _load_is_cell(cnm_file, z)
             if is_cell is None:
                 is_cell = np.ones(len(neurons), dtype=bool)
