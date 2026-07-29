@@ -32,7 +32,7 @@ def _detect_zplanes(folder: str) -> list[str]:
     zs = set()
     for f in path.iterdir():
         if f.suffix == ".tif":
-            m = re.findall(r"(\d{6})ome", f.stem)
+            m = re.findall(r"(\d{6})\.ome", f.stem)
             if m:
                 zs.add(f"z{int(m[0])}")
     return sorted(zs)
