@@ -20,6 +20,28 @@ class ROIEditorWindow(ctk.CTkToplevel):
     _REGION    = "region"
     _SUBREGION = "subregion"
 
+    # Reference-panel LUTs.  The middle button is relabelled to the selected
+    # channel's own LUT — "Red" on the structural channel, "Green" on the
+    # functional one — so one three-way control serves both.
+    _GRAY  = "Gray"
+    _MERGE = "Merge"
+    _RED   = "Red"
+    _GREEN = "Green"
+    _PLANE = {_RED: 0, _GREEN: 1}          # LUT name → RGB plane index
+
+    # internal LUT modes, independent of the middle button's current label
+    _LUT_GRAY  = "gray"
+    _LUT_CH    = "channel"
+    _LUT_MERGE = "merge"
+
+    # Reference-panel temporal statistic.  Applies to the LEFT panel only — the
+    # functional image on the right (and the green half of Merge) keeps whatever
+    # projection the pipeline produced, so mean-tdTomato beside p99-GCaMP stays
+    # available as a comparison.
+    _MEAN = "Mean"
+    _P99  = "P99"
+    _STAT = {_MEAN: "mean", _P99: "p99"}
+
     _INSTRUCTIONS = {
         "remove": (
             "RIGHT-CLICK on a colored patch to remove that neuron.\n\n"
@@ -39,12 +61,15 @@ class ROIEditorWindow(ctk.CTkToplevel):
         "subregion": (
             "Define two sub-regions (A=yellow, B=cyan).\n\n"
             "LEFT-CLICK to place vertices. RIGHT-CLICK to confirm each region.\n\n"
-            "After both are drawn, use Snap Boundaries if needed, then Finish."
+            "After both are drawn, use Snap Boundaries if needed, then Finish.\n\n"
+            "Reference Panel below sets what the left image shows."
         ),
     }
 
     def __init__(self, parent, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file, on_finish,
-                 display_settings=None, mc_img_bkg=None):
+                 display_settings=None, mc_img_bkg=None,
+                 channels=None, channel_loader=None, channel_default=None,
+                 channel_note="", channel_luts=None):
         super().__init__(parent)
         self.title(f"ROI Curation — {z}")
         self.resizable(True, True)
@@ -56,6 +81,25 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._roi_bkg   = roi_img_bkg.copy()
         self._roi_msk   = roi_img_mask.copy()
         self._mc_bkg    = mc_img_bkg  # structural channel for sub-region orientation
+
+        # reference-channel selection (sub-region mode only) — lets the user
+        # pick whichever channel carries the anatomical label (e.g. tdTomato)
+        self._channels  = list(channels or [])
+        self._ch_loader = channel_loader
+        self._ch_cur    = channel_default
+        self._ch_note   = channel_note
+        # cached per (channel, statistic) — each pair is computed at most once
+        self._ch_cache  = {}
+        self._stat_cur  = self._MEAN
+        if channel_default and mc_img_bkg is not None:
+            self._ch_cache[(channel_default, "mean")] = (mc_img_bkg, channel_note)
+
+        # {channel: LUT name}, from the rig's PMT assignment — structural on the
+        # red detector, functional on the green one.  Anything unmapped is shown
+        # red, matching the old behaviour.
+        self._ch_luts   = dict(channel_luts or {})
+        self._struct_ch = channel_default      # the red/structural channel
+        self._lut_mode  = self._LUT_CH
 
         h, w = roi_img_bkg.shape[:2]
         self._ih, self._iw = h, w
@@ -123,42 +167,64 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._canvas.bind("<B1-Motion>",       self._on_left_mv)
         self._canvas.bind("<ButtonRelease-1>", self._on_left_up)
 
-        panel = ctk.CTkFrame(outer, width=220)
+        # 250 not 220: the scrollable body's scrollbar needs ~20 px on top of the
+        # 190-wide controls plus their 10 px padding.
+        panel = ctk.CTkFrame(outer, width=250)
         panel.grid(row=0, column=1, sticky="nsew")
         panel.grid_propagate(False)
+        panel.pack_propagate(False)
 
-        ctk.CTkLabel(panel, text="Mode",
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(12, 6), padx=10)
+        # The action buttons live in a fixed footer packed BEFORE the body, so
+        # they always reserve their space.  Previously everything shared one
+        # frame and the bottom-packed buttons were squeezed out of view as
+        # controls were added above them.
+        footer = ctk.CTkFrame(panel, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", pady=(4, 8))
+        ctk.CTkButton(footer, text="Finish ✓", width=190,
+                      fg_color="#2d6a2d", hover_color="#1e4d1e",
+                      command=self._do_finish).pack(side="bottom", padx=10, pady=3)
+        self._snap_btn = ctk.CTkButton(footer, text="Snap Boundaries", width=190,
+                                       state="disabled", command=self._sreg_snap)
+        self._snap_btn.pack(side="bottom", padx=10, pady=3)
+        ctk.CTkButton(footer, text="Undo", width=190,
+                      command=self._undo).pack(side="bottom", padx=10, pady=3)
+
+        # Everything else scrolls, so the panel can hold more controls than fit.
+        body = ctk.CTkScrollableFrame(panel, fg_color="transparent")
+        body.pack(side="top", fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Mode",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(4, 6), padx=10)
 
         self._mode_btns = {}
         for key, lbl in [(self._REMOVE,    "Remove Neurons"),
                           (self._ADD,       "Add Neuron"),
                           (self._REGION,    "Exclude Region"),
                           (self._SUBREGION, "Define Sub-Regions")]:
-            b = ctk.CTkButton(panel, text=lbl, width=190,
+            b = ctk.CTkButton(body, text=lbl, width=190,
                                command=lambda k=key: self._set_mode(k))
             b.pack(pady=3, padx=10)
             self._mode_btns[key] = b
 
-        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkFrame(body, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
 
-        self._instr = ctk.CTkLabel(panel, text="", wraplength=200,
+        self._instr = ctk.CTkLabel(body, text="", wraplength=190,
                                     justify="left", anchor="nw")
         self._instr.pack(padx=10, fill="x")
 
-        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkFrame(body, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
 
-        self._status = ctk.CTkLabel(panel, text="", wraplength=200,
+        self._status = ctk.CTkLabel(body, text="", wraplength=190,
                                      text_color="#aaaaaa", anchor="w")
         self._status.pack(padx=10, fill="x")
 
         # ── display settings sliders ──────────────────────────────────────────
-        ctk.CTkFrame(panel, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
-        ctk.CTkLabel(panel, text="Display Settings",
+        ctk.CTkFrame(body, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(body, text="Display Settings",
                      font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(0, 4))
 
         def _make_slider(label, var, from_, to, steps):
-            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row = ctk.CTkFrame(body, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=2)
             val_lbl = ctk.CTkLabel(row, width=38, anchor="e",
                                    text=f"{var.get():.2f}")
@@ -177,15 +243,37 @@ class ROIEditorWindow(ctk.CTkToplevel):
         _make_slider("Bright clip%", self._hi_var,  70.0, 100.0, 300)
         # ─────────────────────────────────────────────────────────────────────
 
-        ctk.CTkButton(panel, text="Finish ✓", width=190,
-                       fg_color="#2d6a2d", hover_color="#1e4d1e",
-                       command=self._do_finish).pack(side="bottom", padx=10, pady=4)
-        self._snap_btn = ctk.CTkButton(panel, text="Snap Boundaries", width=190,
-                                        state="disabled",
-                                        command=self._sreg_snap)
-        self._snap_btn.pack(side="bottom", padx=10, pady=4)
-        ctk.CTkButton(panel, text="Undo", width=190,
-                       command=self._undo).pack(side="bottom", padx=10, pady=4)
+        # ── reference panel: channel + LUT (sub-region mode) ──────────────────
+        ctk.CTkFrame(body, height=2, fg_color="gray40").pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(body, text="Reference Panel",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(0, 4))
+
+        self._ch_menu = None
+        if self._ch_loader is not None and len(self._channels) > 1:
+            self._ch_var = tk.StringVar(
+                value=self._ch_cur if self._ch_cur in self._channels else self._channels[0])
+            self._ch_menu = ctk.CTkOptionMenu(
+                body, values=self._channels, variable=self._ch_var,
+                width=190, command=self._on_channel_change)
+            self._ch_menu.pack(padx=10, pady=2)
+
+        self._ref_color_var = tk.StringVar()
+        self._ref_color_btn = ctk.CTkSegmentedButton(
+            body, values=[self._GRAY, self._RED, self._MERGE],
+            variable=self._ref_color_var, command=self._on_lut_change)
+        self._ref_color_btn.pack(padx=10, pady=(4, 2), fill="x")
+
+        self._stat_var = tk.StringVar(value=self._MEAN)
+        self._stat_btn = ctk.CTkSegmentedButton(
+            body, values=[self._MEAN, self._P99],
+            variable=self._stat_var, command=self._on_stat_change)
+        self._stat_btn.pack(padx=10, pady=(2, 2), fill="x")
+
+        self._lut_caption = ctk.CTkLabel(
+            body, text="", text_color="#888888", wraplength=190,
+            justify="left", anchor="w")
+        self._lut_caption.pack(padx=10, pady=(0, 4), fill="x")
+        self._sync_lut_buttons()
 
         self.protocol("WM_DELETE_WINDOW", self._do_finish)
 
@@ -200,26 +288,157 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._poly_pts = []
         self._poly_ids = []
 
-        if mode == self._SUBREGION:
+        # _sreg_canvas_ids only has indices 0 and 1, so guard with _sreg_cur < 2
+        # (it is 2 once both regions are confirmed).
+        if mode == self._SUBREGION and self._sreg_cur < 2:
             # clear any in-progress polygon drawing for the current region
             for pid in self._sreg_canvas_ids[self._sreg_cur]:
                 self._canvas.delete(pid)
             self._sreg_canvas_ids[self._sreg_cur] = []
             self._sreg_polys[self._sreg_cur] = []
             # keep _sreg_masks intact so confirmed regions survive mode switches
-            ref_lbl = ("Structural channel  (anatomy / MC)"
-                       if self._mc_bkg is not None else "Reference  (no ROIs)")
-        else:
-            ref_lbl = "Reference  (no ROIs)"
 
-        if hasattr(self, '_lbl_ref'):
-            self._lbl_ref.configure(text=ref_lbl)
+        self._update_ref_label()
+        _ref_state = "normal" if mode == self._SUBREGION else "disabled"
+        if getattr(self, '_ch_menu', None) is not None:
+            self._ch_menu.configure(state=_ref_state)
+        if getattr(self, '_ref_color_btn', None) is not None:
+            self._ref_color_btn.configure(state=_ref_state)
+        if getattr(self, '_stat_btn', None) is not None:
+            # needs provenance-backed loading to recompute the projection
+            self._stat_btn.configure(
+                state=_ref_state if self._channels else "disabled")
 
         for k, btn in self._mode_btns.items():
             btn.configure(fg_color="#1a5276" if k == mode else ("#3b8ed0", "#1f6aa5"))
         self._instr.configure(text=self._INSTRUCTIONS.get(mode, ""))
         self._status.configure(text="")
         self._refresh_canvas()
+
+    # ── reference channel ─────────────────────────────────────────────────────
+
+    def _update_ref_label(self):
+        if not hasattr(self, '_lbl_ref'):
+            return
+        if self._mode == self._SUBREGION and self._mc_bkg is not None:
+            ch  = self._ch_cur or "structural"
+            lut = (self._MERGE if self._lut_mode == self._LUT_MERGE else
+                   self._GRAY  if self._lut_mode == self._LUT_GRAY  else
+                   self._lut_for(self._ch_cur))
+            txt = (f"Reference — {ch} · {self._stat_cur} · {lut}"
+                   + (f"  ({self._ch_note})" if self._ch_note else ""))
+        else:
+            txt = "Reference  (no ROIs)"
+        self._lbl_ref.configure(text=txt)
+
+    def _lut_for(self, ch):
+        """LUT name for a channel — red unless the rig put it on the green PMT."""
+        return self._ch_luts.get(ch, self._RED)
+
+    def _sync_lut_buttons(self):
+        """Relabel the middle button to the selected channel's own LUT.
+
+        Keeps one three-way control for both channels: it reads Gray / Red /
+        Merge on the structural channel and Gray / Green / Merge on the
+        functional one, without the selected mode changing underneath the user.
+        """
+        ch_lbl = self._lut_for(self._ch_cur)
+        self._ref_color_btn.configure(values=[self._GRAY, ch_lbl, self._MERGE])
+        self._ref_color_var.set({self._LUT_GRAY:  self._GRAY,
+                                 self._LUT_MERGE: self._MERGE}.get(self._lut_mode, ch_lbl))
+        self._lut_caption.configure(
+            text=f"{ch_lbl} LUT, as Prairie View shows that PMT.  "
+                 f"Merge overlays both channels.\n"
+                 "Mean: best SNR on a static label.  P99: matches the "
+                 "functional panel.\nLeft panel only.")
+
+    def _on_lut_change(self, value):
+        self._lut_mode = (self._LUT_GRAY  if value == self._GRAY else
+                          self._LUT_MERGE if value == self._MERGE else
+                          self._LUT_CH)
+        self._update_ref_label()
+        self._refresh_canvas()
+
+    def _apply_ref_lut(self, ref, func):
+        """Colourise the reference panel.
+
+        PMT data carries intensity only — the red/green you see on the rig and in
+        papers is a display LUT, which Prairie View applies to the Ch1 (red,
+        570-640 nm → tdTomato) and Ch2 (green, 500-550 nm → GCaMP) detectors.
+        Same idea here: purely a display choice, the arrays stay untouched.
+
+        `ref` is the selected channel, `func` the functional one, both already
+        contrast-stretched (h, w, 3) uint8 with the grey value replicated across
+        the three planes — so plane 0 of either is its intensity image.
+        """
+        if self._lut_mode == self._LUT_GRAY:
+            return ref
+
+        out = np.zeros_like(ref)
+        if self._lut_mode == self._LUT_CH:
+            out[..., self._PLANE.get(self._lut_for(self._ch_cur), 0)] = ref[..., 0]
+            return out
+
+        # Merge: structural red + functional green, whichever channel the
+        # dropdown happens to be on.
+        struct = ref if self._ch_cur == self._struct_ch else self._struct_bright()
+        if struct is not None:
+            out[..., 0] = struct[..., 0]
+        out[..., 1] = func[..., 0]
+        return out
+
+    def _struct_bright(self):
+        """Contrast-stretched structural channel, independent of the dropdown.
+
+        Prefers the current statistic, then falls back to the mean, which is
+        always preloaded — so switching to Merge never blocks on a P99 that has
+        not been computed yet.
+        """
+        stat = self._STAT.get(self._stat_var.get(), "mean")
+        for key in ((self._struct_ch, stat), (self._struct_ch, "mean")):
+            img, _ = self._ch_cache.get(key, (None, ""))
+            if img is not None:
+                return self._stretch(img)
+        return None
+
+    def _load_ref(self, ch) -> bool:
+        """Put (channel, current statistic) on the reference panel.
+
+        Each pair is computed once and cached; P99 needs a partial sort per
+        pixel, so the first switch can take a moment.
+        """
+        if ch is None or self._ch_loader is None:
+            return False
+
+        stat_lbl = self._stat_var.get()
+        key      = (ch, self._STAT.get(stat_lbl, "mean"))
+        if key not in self._ch_cache:
+            self._status.configure(text=f"Loading {ch} · {stat_lbl} …")
+            self.update_idletasks()
+            self._ch_cache[key] = self._ch_loader(*key) or (None, "")
+
+        img, note = self._ch_cache[key]
+        if img is None:
+            self._status.configure(text=f"{ch} · {stat_lbl} could not be loaded.")
+            return False
+
+        self._ch_cur, self._mc_bkg, self._ch_note = ch, img, note
+        self._stat_cur = stat_lbl
+        self._status.configure(text=f"Reference: {ch} · {stat_lbl} ({note}).")
+        self._sync_lut_buttons()
+        self._update_ref_label()
+        self._refresh_canvas()
+        return True
+
+    def _on_channel_change(self, ch):
+        """Swap the reference image to another acquisition channel."""
+        if not self._load_ref(ch) and self._ch_cur:
+            self._ch_var.set(self._ch_cur)      # revert to what is on screen
+
+    def _on_stat_change(self, _value):
+        """Swap the reference image between the mean and the 99th percentile."""
+        if not self._load_ref(self._ch_cur):
+            self._stat_var.set(self._stat_cur)  # revert to what is on screen
 
     # ── canvas ────────────────────────────────────────────────────────────────
 
@@ -238,18 +457,21 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._scale_y = h / self._ih
             self._refresh_canvas()
 
-    def _bright_bkg(self) -> np.ndarray:
+    def _stretch(self, img) -> np.ndarray:
         """Contrast-stretch + gamma lift using slider-controlled parameters."""
-        bkg   = self._roi_bkg.astype(np.float32)
-        lo    = np.percentile(bkg, self._lo_var.get())
-        hi    = np.percentile(bkg, self._hi_var.get())
+        f     = np.asarray(img, dtype=np.float32)
+        lo    = np.percentile(f, self._lo_var.get())
+        hi    = np.percentile(f, self._hi_var.get())
         gamma = self._gamma_var.get()
         if hi > lo:
-            bkg = np.clip((bkg - lo) / (hi - lo), 0, 1)
+            f = np.clip((f - lo) / (hi - lo), 0, 1)
         else:
-            bkg = np.zeros_like(bkg)
-        bkg = np.power(bkg, gamma) * 255
-        return np.clip(bkg, 0, 255).astype(np.uint8)
+            f = np.zeros_like(f)
+        return np.clip(np.power(f, gamma) * 255, 0, 255).astype(np.uint8)
+
+    def _bright_bkg(self) -> np.ndarray:
+        """The functional-channel background, contrast-stretched."""
+        return self._stretch(self._roi_bkg)
 
     def _refresh_canvas(self):
         from PIL import Image as PILImage, ImageTk
@@ -268,18 +490,11 @@ class ROIEditorWindow(ctk.CTkToplevel):
                     sreg_overlay[mask] = col
 
         # ── reference canvas ──────────────────────────────────────────────────
-        # In sub-region mode show the structural (MC) channel so the user can
-        # orient anatomically.  Fall back to functional if MC is unavailable.
+        # In sub-region mode show the structural (MC) channel, through the LUT
+        # chosen in the panel, so the user can orient anatomically.  Fall back to
+        # the functional channel if MC is unavailable.
         if self._mode == self._SUBREGION and self._mc_bkg is not None:
-            mc_f  = self._mc_bkg.astype(np.float32)
-            lo    = np.percentile(mc_f, self._lo_var.get())
-            hi    = np.percentile(mc_f, self._hi_var.get())
-            gamma = self._gamma_var.get()
-            if hi > lo:
-                mc_f = np.clip((mc_f - lo) / (hi - lo), 0, 1)
-            else:
-                mc_f = np.zeros_like(mc_f)
-            ref_bright = np.clip(np.power(mc_f, gamma) * 255, 0, 255).astype(np.uint8)
+            ref_bright = self._apply_ref_lut(self._stretch(self._mc_bkg), func_bright)
         else:
             ref_bright = func_bright
 

@@ -323,6 +323,7 @@ class PipelineGUI(ctk.CTk):
 
         ap = prov.get("analysis_params") or {}
         if ap:
+            if "z_planes"      in ap: self.z_planes_var.set(",".join(ap["z_planes"]))
             if "frame_period"  in ap: self.frame_period_var.set(str(ap["frame_period"]))
             if "pre_discard_s" in ap: self.pre_discard_var.set(str(ap["pre_discard_s"]))
             if "baseline_s"    in ap: self.baseline_var.set(str(ap["baseline_s"]))
@@ -419,8 +420,10 @@ class PipelineGUI(ctk.CTk):
 
         self.mc_ch_var   = ctk.StringVar(value="ch1")
         self.func_ch_var = ctk.StringVar(value="ch2")
-        field("Motion-correction channel:", self.mc_ch_var,   "structural / anatomical")
-        field("Functional channel:",        self.func_ch_var, "calcium indicator signal")
+        field("Motion-correction channel:", self.mc_ch_var,
+              "structural / anatomical  —  Prairie View Ch1 = red PMT (tdTomato)")
+        field("Functional channel:",        self.func_ch_var,
+              "calcium indicator signal  —  Prairie View Ch2 = green PMT (GCaMP)")
 
         ctk.CTkLabel(tab, text="─" * 62, text_color="gray").pack(pady=8)
         ctk.CTkLabel(tab, text="Cellpose ROI detection",
@@ -749,6 +752,134 @@ class PipelineGUI(ctk.CTk):
         self.run_btn.configure(state="disabled", text="Running…")
         threading.Thread(target=self._run_pipeline, args=(p,), daemon=True).start()
 
+    # ── reference-channel loading for the sub-region view ─────────────────────
+
+    @staticmethod
+    def _channel_list(provenance, z) -> list[str]:
+        """Every channel name present for this z-plane, motion-corrected or not.
+
+        combine_tiffs writes one combined TIFF per channel found in the raw
+        acquisition, so channels outside ch_dict (e.g. a tdTomato channel that
+        is neither the functional nor the motion-correction channel) are still
+        on disk and can be shown as an anatomical reference.
+        """
+        chans: list[str] = []
+        sessions = ((provenance.get('load_data') or {}).get('filenames') or {})
+        for sess in sessions.values():
+            for ch in ((sess or {}).get(z) or {}):
+                if ch not in chans:
+                    chans.append(ch)
+        rig = (((provenance.get('rigid_motion_correction') or {}).get(z) or {})
+               .get('filenames') or {})
+        for ch in rig:
+            if ch not in chans:
+                chans.append(ch)
+        return sorted(chans)
+
+    def _gray_to_bkg(self, img, target_hw, tag=""):
+        """Resize a 2-D projection to target_hw and replicate to three planes.
+
+        Deliberately keeps **float32** precision.  The old version divided by
+        img.max() and cast to uint8 here, before the editor's contrast sliders
+        ever saw the data.  On a dim channel with one bright outlier that
+        collapses the whole low end onto a handful of integer levels — most of
+        the frame lands on exactly 0 — which both destroys faint structure and
+        makes the Dark clip slider a no-op, since every low percentile then
+        returns the same value.  The editor's _stretch() does its own
+        percentile normalisation, so quantising early buys nothing.
+        """
+        import cv2 as cv
+
+        img    = np.asarray(img, dtype=np.float32)
+        th, tw = target_hw
+        if img.shape != (th, tw):
+            self._log(f"  {tag} dims {img.shape} differ from functional "
+                      f"{(th, tw)},  resizing to match.")
+            img = cv.resize(img, (tw, th), interpolation=cv.INTER_LINEAR)
+
+        pct = np.percentile(img, [0, 1, 25, 50, 75, 99, 100])
+        self._log(f"  {tag} intensity 0/1/25/50/75/99/100 pct: "
+                  + "  ".join(f"{v:.1f}" for v in pct))
+        return np.repeat(img[:, :, None], 3, axis=2)
+
+    @staticmethod
+    def _reduce_memmap(Yr, dims, stat, chunk=8192):
+        """Per-pixel temporal statistic over a CaImAn memmap.
+
+        `Yr` is (n_pixels, T), so each pixel's time course is one row and any
+        temporal statistic is a row-wise reduction.  Chunking over pixels keeps
+        peak memory at chunk x T floats instead of the whole movie.
+        """
+        n   = Yr.shape[0]
+        out = np.empty(n, dtype=np.float32)
+        for i in range(0, n, chunk):
+            blk = np.asarray(Yr[i:i + chunk], dtype=np.float32)
+            out[i:i + chunk] = (blk.mean(axis=1) if stat == "mean"
+                                else np.percentile(blk, 99, axis=1))
+        return out.reshape(dims, order='F')
+
+    @staticmethod
+    def _reduce_stack(stack, stat):
+        """Same statistic over an in-memory (T, h, w) stack."""
+        if stack.ndim == 2:
+            return stack
+        return (stack.mean(axis=0) if stat == "mean"
+                else np.percentile(stack, 99, axis=0))
+
+    def _channel_background(self, provenance, z, ch, target_hw, stat="mean"):
+        """Temporal projection of `ch` as ((h, w, 3) uint8, note).
+
+        `stat` is "mean" (best SNR on a static label such as tdTomato — averaging
+        T frames cuts shot noise by sqrt(T)) or "p99" (the same 99th-percentile
+        statistic the functional summary image uses, which sees past motion-
+        correction border fill and vessel shadows).  Display only: nothing here
+        feeds the analysis, the seeding image is built separately in
+        pipeline._identify_rois.
+
+        Prefers the motion-corrected memmap.  Channels that were never motion
+        corrected fall back to their raw combined TIFF.  Returns (None, "") when
+        the channel cannot be loaded.
+        """
+        import caiman as cm
+        from tifffile import imread as _imread
+
+        root = Path(provenance.get('output_dir') or '.')
+
+        rig = (((provenance.get('rigid_motion_correction') or {}).get(z) or {})
+               .get('filenames') or {})
+        path = rig.get(ch)
+        if path:
+            path = Path(path)
+            if not path.is_absolute():
+                path = root / z / path.name
+            if path.exists():
+                try:
+                    Yr, dims, _T = cm.load_memmap(str(path))
+                    img = self._reduce_memmap(Yr, dims, stat)
+                except Exception:
+                    # not a CaImAn memmap — fall back to loading the movie whole
+                    img = self._reduce_stack(
+                        np.asarray(cm.load(str(path)), dtype=np.float32), stat)
+                return (self._gray_to_bkg(img, target_hw, tag=f"{ch} {stat}"),
+                        "motion-corrected")
+
+        sessions = ((provenance.get('load_data') or {}).get('filenames') or {})
+        for sess in sessions.values():
+            raw = ((sess or {}).get(z) or {}).get(ch)
+            if not raw:
+                continue
+            raw = Path(raw)
+            if not raw.is_absolute():
+                raw = root / raw.name
+            if not raw.exists():
+                continue
+            stack = np.asarray(_imread(str(raw))).squeeze().astype(np.float32)
+            return (self._gray_to_bkg(self._reduce_stack(stack, stat),
+                                      target_hw, tag=f"{ch} {stat}"),
+                    "raw, not motion-corrected")
+
+        return None, ""
+
     def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
         """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
         import yaml
@@ -763,31 +894,52 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._display_settings = {}
 
-        mc_img_bkg = None
-        try:
-            import caiman as cm
-            import cv2 as cv
-            from PIL import Image as _PILImg
-            mc_movie = cm.load(mc_corr_file)
-            mc_mean  = np.mean(mc_movie, axis=0)
-            scale    = mc_mean.max()
-            if scale > 0:
-                mc_gray = (mc_mean * 190 / scale).astype(np.uint8)
-                func_h, func_w = roi_img_bkg.shape[:2]
-                mc_h, mc_w = mc_gray.shape
-                if (mc_h, mc_w) != (func_h, func_w):
-                    self._log(
-                        f"  MC channel dims {(mc_h, mc_w)} differ from functional "
-                        f"{(func_h, func_w)},  resizing MC background to match.")
-                    mc_gray = np.array(
-                        _PILImg.fromarray(mc_gray).resize(
-                            (func_w, func_h), _PILImg.BILINEAR))
-                else:
-                    self._log(
-                        f"  MC background dims match functional ({func_h}×{func_w}), no resize needed.")
-                mc_img_bkg = cv.cvtColor(mc_gray, cv.COLOR_GRAY2RGB)
-        except Exception as _e:
-            self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
+        # ── sub-region reference channel ──────────────────────────────────────
+        # Defaults to the motion-correction channel, but every channel found in
+        # the acquisition is offered so the user can pick whichever one carries
+        # the anatomical label (tdTomato) for AP / NTS orientation.
+        target_hw  = roi_img_bkg.shape[:2]
+        provenance = getattr(self, '_provenance', None)
+        channels, ch_default, ch_luts = [], None, {}
+        if provenance is not None:
+            try:
+                ch_dict = ((provenance.get('load_data') or {}).get('args') or {}).get('ch_dict', {})
+                ch_default = ch_dict.get('mc_ch')
+                channels   = self._channel_list(provenance, z)
+                # Prairie View puts the structural label on the red PMT and the
+                # calcium indicator on the green one; mirror that in the viewer.
+                if ch_dict.get('mc_ch'):
+                    ch_luts[ch_dict['mc_ch']] = "Red"
+                if ch_dict.get('func_ch'):
+                    ch_luts[ch_dict['func_ch']] = "Green"
+                self._log(f"  Sub-region reference channels available: {', '.join(channels) or 'none'}")
+            except Exception as _e:
+                self._log(f"  Warning: could not enumerate channels ({_e})")
+
+        def _load_channel(ch, stat="mean"):
+            try:
+                return self._channel_background(provenance, z, ch, target_hw, stat)
+            except Exception as _e:
+                self._log(f"  Warning: could not load channel {ch} ({stat}) "
+                          f"for sub-region view ({_e})")
+                return None, ""
+
+        mc_img_bkg, mc_note = None, ""
+        if provenance is not None and ch_default:
+            mc_img_bkg, mc_note = _load_channel(ch_default, "mean")
+        if mc_img_bkg is None:
+            # Fall back to the motion-corrected file the pipeline handed us.  The
+            # channel picker is dropped here: if provenance could not serve the
+            # default channel it cannot be trusted to serve the others either.
+            channels = []
+            try:
+                import caiman as cm
+                mc_img_bkg = self._gray_to_bkg(
+                    np.mean(cm.load(mc_corr_file), axis=0), target_hw, tag="MC channel")
+                mc_note = "motion-corrected"
+                ch_default = ch_default or "MC"
+            except Exception as _e:
+                self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
 
         result_holder = [None]
         done = threading.Event()
@@ -798,7 +950,10 @@ class PipelineGUI(ctk.CTk):
                 done.set()
             ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
                             _on_finish, display_settings=self._display_settings,
-                            mc_img_bkg=mc_img_bkg)
+                            mc_img_bkg=mc_img_bkg,
+                            channels=channels, channel_loader=_load_channel,
+                            channel_default=ch_default, channel_note=mc_note,
+                            channel_luts=ch_luts)
 
         self.after(0, _show)
         done.wait()
@@ -972,6 +1127,17 @@ class PipelineGUI(ctk.CTk):
             f"({n_stims} session(s) × {d['ses_f']} = {n_stims * d['ses_f']} total)"
         )
 
+        def _record_analysis_params(provenance, n_stims_val):
+            provenance['analysis_params'] = dict(
+                frame_period=fp, pre_discard_s=pre_s,
+                baseline_s=base_s, stim_s=stim_s, threshold=threshold,
+                n_stims=n_stims_val, z_planes=p["z_planes"],
+                cp_diameter=p["cellpose"]["diameter"],
+                cp_flow_threshold=p["cellpose"]["flow_threshold"],
+                cp_cellprob=p["cellpose"]["cellprob_threshold"],
+            )
+            _save_provenance(provenance)
+
         _all_stims_n: list[list[np.ndarray]] = []   # [animal][stim_idx] → (K, T)
         _z_ids:  list[np.ndarray] = []
         _all_region_labels: list[np.ndarray] = []
@@ -984,6 +1150,14 @@ class PipelineGUI(ctk.CTk):
             self._log(f"\n── Animal {i + 1}  ({label})")
 
             provenance = init(out_dir)
+            # made available to _roi_editor_for_pipeline, which is called from
+            # inside source_extraction and has no provenance of its own
+            self._provenance = provenance
+
+            # Persist the run configuration immediately, before any processing,
+            # so reopening this project later recovers the settings actually used
+            # even if the run is interrupted or only an earlier stage is selected.
+            _record_analysis_params(provenance, n_stims)
 
             if self.do_mc.get():
                 for z in p["z_planes"]:
@@ -999,6 +1173,9 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._log("  Skipping motion correction,  loading saved provenance.")
                 provenance = _get_provenance(out_dir)
+                self._provenance = provenance
+
+            self._provenance = provenance
 
             if self.do_cnmf.get():
                 roi_fn = self._roi_editor_for_pipeline
@@ -1026,6 +1203,7 @@ class PipelineGUI(ctk.CTk):
 
             if self.do_subregion_setup.get():
                 self._log("  Sub-region setup, ROI editor will open for sub-region definition …")
+                self._provenance = provenance
                 try:
                     import caiman as cm
                     import cv2 as _cv2
@@ -1154,15 +1332,7 @@ class PipelineGUI(ctk.CTk):
                     baseline_s=base_s,
                     stim_s=stim_s,
                 )
-                provenance['analysis_params'] = dict(
-                    frame_period=fp, pre_discard_s=pre_s,
-                    baseline_s=base_s, stim_s=stim_s, threshold=threshold,
-                    n_stims=len(stims_n),
-                    cp_diameter=p["cellpose"]["diameter"],
-                    cp_flow_threshold=p["cellpose"]["flow_threshold"],
-                    cp_cellprob=p["cellpose"]["cellprob_threshold"],
-                )
-                _save_provenance(provenance)
+                _record_analysis_params(provenance, len(stims_n))
 
                 # Accumulate per-animal stims,  each is a list of N arrays
                 _all_stims_n.append(stims_n)
