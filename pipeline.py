@@ -558,10 +558,13 @@ def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_
 
 def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
             rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=_USE_GPU,
-            K=300, gSig=[10,10]):
+            K=300, gSig=[10,10], max_processes=None):
 
 
     """
+    'max_processes': None, # worker cap; None = cores - 1.  The actual count is
+                           # sized to free RAM at run time (worker_budget.py)
+
     'fr': MCVID_PARAMS['fr'],
     'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
     'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
@@ -582,29 +585,43 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
     inputs.pop('z')
     inputs.pop('func_ch_file')
     inputs.pop('roi_masks')
+    inputs.pop('max_processes')
 
     from caiman.source_extraction.cnmf import cnmf
     from caiman.source_extraction.cnmf import params
-
-    opts = params.CNMFParams(params_dict=inputs)
-
-
-    _, dview, n_processes = cm.cluster.setup_cluster(
-        backend='multiprocessing', n_processes=None, single_thread=False)
-
-
-    # do an initial fit of the cnmf
-    cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
+    from worker_budget import plan_cnmf_workers
 
     Yr, dims, T = cm.load_memmap(func_ch_file)
     f_ch_rigcorr = np.reshape(Yr.T, [T] + list(dims), order='F')
 
-    cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
+    # Worker count follows free RAM instead of CaImAn's cores-1 default, and each
+    # worker gets a fixed-size pixel chunk rather than 1/n of the movie, so the
+    # data held at once scales with the workers actually running.
+    n_workers, npx, plan = plan_cnmf_workers(T, max_processes)
+    print(f"  {plan}")
 
-    cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
-    cnm.estimates.select_components(use_object=True)
+    while True:
+        opts = params.CNMFParams(params_dict=inputs)
+        opts.set('preprocess', {'n_pixels_per_process': npx})
+        _, dview, n_processes = cm.cluster.setup_cluster(
+            backend='multiprocessing', n_processes=n_workers, single_thread=False)
+        try:
+            # do an initial fit of the cnmf
+            cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
+            cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
 
-    cm.stop_server(dview=dview)
+            cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
+            cnm.estimates.select_components(use_object=True)
+            break
+        except MemoryError:
+            # other programs may have taken memory since the plan was made
+            if n_workers <= 1:
+                raise
+            n_workers = max(1, n_workers // 2)
+            print(f"  ⚠ CNMF ran out of memory, retrying with {n_workers} worker(s) …")
+        finally:
+            cm.stop_server(dview=dview)
+
     cnm.dview = None  # must be None before save so file is marked correctly
 
     cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
