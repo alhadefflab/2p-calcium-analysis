@@ -2,7 +2,7 @@
 
 CaImAn's default is one worker per core minus one, whatever the RAM.  On Windows
 each worker is a fresh process that re-imports CaImAn, so on a 20-core machine
-that is 19 × (import cost + data chunk) — enough to exhaust RAM and freeze it.
+that is 19 × (import cost + data chunk): enough to exhaust RAM and freeze it.
 
 The plan here:
   * measure one real worker's import cost (one process, then it exits),

@@ -596,6 +596,12 @@ class PipelineGUI(ctk.CTk):
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
+        self.resume_curation = ctk.CTkCheckBox(
+            stages,
+            text="Resume previous ROI curation,  reopen the editor with the neurons you "
+                 "added / removed last time instead of a fresh Cellpose detection")
+        self.resume_curation.pack(anchor="w", padx=40, pady=(0, 4))
+
         self.do_subregion_setup = ctk.CTkCheckBox(
             stages,
             text="Sub-region setup,  (re)draw the AP outline (rest = NTS) without re-running CNMF")
@@ -956,8 +962,11 @@ class PipelineGUI(ctk.CTk):
             prev = load_curation(output_dir, z)
         except Exception as _e:
             self._log(f"  Warning: could not read previous ROI curation for {z} ({_e})")
-        prev_rec = prev[0] or {}
-        reuse_ids = (subregion_only
+        # a resumed plane uses the record its masks were rebuilt from, whose id
+        # list matches those masks column for column
+        prev_rec = getattr(self, '_resumed_planes', {}).get(z) or prev[0] or {}
+        resumed = z in getattr(self, '_resumed_planes', {})
+        reuse_ids = ((subregion_only or resumed)
                      and len(prev_rec.get("final_ids") or []) == roi_masks.shape[1])
         ap_polygon = prev_rec.get("ap_polygon")
         if ap_polygon:
@@ -1030,6 +1039,28 @@ class PipelineGUI(ctk.CTk):
                 self._log(traceback.format_exc())
 
         return new_masks, roi_masks_file, new_bkg, new_mask_img
+
+    def _load_previous_curation(self, plane_dir, z):
+        """initial_rois_fn for source_extraction: the ROIs saved by this plane's
+        last curation, or None (→ Cellpose runs as usual)."""
+        from analysis.roi_curation import load_curated_masks
+        try:
+            got = load_curated_masks(plane_dir, z)
+        except Exception as _e:
+            self._log(f"  Warning: could not load previous curation for {z} ({_e}), "
+                      "running Cellpose.")
+            return None
+        if got is None:
+            self._log(f"  {z}: no previous curation saved, running Cellpose.")
+            return None
+        masks, rec = got
+        self._resumed_planes[z] = rec
+        self._log(
+            f"  {z}: resuming previous curation, {masks.shape[1]} ROIs "
+            f"({len(rec.get('added_ids', []))} added, "
+            f"{len(rec.get('removed_manual_ids', [])) + len(rec.get('removed_region_ids', []))} "
+            f"removed last time). Cellpose skipped.")
+        return masks
 
     # ── curation yield ────────────────────────────────────────────────────────
 
@@ -1271,8 +1302,10 @@ class PipelineGUI(ctk.CTk):
 
             self._provenance = provenance
 
+            self._resumed_planes = {}              # z -> record the ROIs came from
             if self.do_cnmf.get():
                 roi_fn = self._roi_editor_for_pipeline
+                resume_fn = self._load_previous_curation if self.resume_curation.get() else None
                 cp = p["cellpose"]
                 self._log(
                     f"  Cellpose params,  diameter: {cp['diameter']}  "
@@ -1291,6 +1324,7 @@ class PipelineGUI(ctk.CTk):
                         provenance, None, z, None,
                         roi_editor_fn=roi_fn,
                         neuron_viewer_fn=_make_viewer_fn(z),
+                        initial_rois_fn=resume_fn,
                         idroi_params=cp)
                     self._report_curation_yield(provenance, z)
             else:

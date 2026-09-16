@@ -5,7 +5,7 @@ The editor hands over a record per z-plane; this module writes it to
 
     roi_curation_<z>.json      ids added / removed, polygons, counts, densities
     roi_curation_<z>_maps.npz  label images (stable ids) before and after, AP mask
-    roi_curation_<z>.png       screenshots — functional and tdTomato views, showing
+    roi_curation_<z>.png       screenshots: functional and tdTomato views, showing
                                the edits (top row) and the AP / NTS split (bottom)
 
 and later fills the record's ``yield`` section as the pipeline proceeds:
@@ -165,6 +165,33 @@ def load_curation(plane_dir, z):
             maps = {k: npz[k] for k in npz.files}
     return rec, maps
 
+def load_curated_masks(plane_dir, z, n_pixels=None):
+    """ROIs as they stood when this plane's curation was finished.
+
+    Returns (roi_masks (h*w, N) bool Fortran order, record) or None when there is
+    no usable record.  Uses the exact saved masks when present; records written
+    before those were stored are rebuilt from the final label image, which is
+    exact except where ROIs overlapped (the shared pixels go to the smaller one).
+    `n_pixels`, if given, must match or None is returned (different FOV).
+    """
+    rec, maps = load_curation(plane_dir, z)
+    if rec is None or maps is None or not rec.get("final_ids"):
+        return None
+    ids = [int(i) for i in rec["final_ids"]]
+    if "final_masks" in maps and maps["final_masks"].shape[1] == len(ids):
+        masks = maps["final_masks"].astype(bool)
+    else:
+        lab_f = maps["final_labels"].ravel(order="F")
+        masks = np.stack([lab_f == i for i in ids], axis=1)
+        keep = masks.any(axis=0)            # an id fully covered by another ROI
+        if not keep.all():
+            masks = masks[:, keep]
+            rec = dict(rec, final_ids=[i for i, k in zip(ids, keep) if k])
+    if n_pixels is not None and masks.shape[0] != n_pixels:
+        return None
+    return masks, rec
+
+
 def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
     """Write the editor's record.  Returns the JSON summary that was written.
 
@@ -253,8 +280,14 @@ def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
     with open(d / f"roi_curation_{z}.json", "w") as f:
         json.dump(summary, f, indent=2)
 
+    extra = {}
+    if rec.get("final_masks") is not None:
+        # exact (h*w, N) masks in final_ids order, overlaps included: what a
+        # resumed curation starts from.  Mostly zeros, so it compresses to little.
+        extra["final_masks"] = np.asarray(rec["final_masks"], dtype=bool)
     np.savez_compressed(
         d / f"roi_curation_{z}_maps.npz",
+        **extra,
         initial_labels=initial.astype(np.int32),
         final_labels=final.astype(np.int32),
         keep_mask=keep.astype(bool),
@@ -363,7 +396,7 @@ def _save_screenshots(path, z, summary, initial, final, n_detected, keep, ap_mas
             ax.set_ylim(h, 0)
             ax.set_xticks([])
             ax.set_yticks([])
-            ax.set_title(f"{title} — {'edits' if row == 0 else 'AP / NTS'}", fontsize=10)
+            ax.set_title(f"{title}: {'edits' if row == 0 else 'AP / NTS'}", fontsize=10)
 
     ac = summary["after_curation"]
     edit_handles = [
@@ -393,7 +426,7 @@ def _save_screenshots(path, z, summary, initial, final, n_detected, keep, ap_mas
                         ha="center", va="center", transform=axes[1, 0].transAxes,
                         fontsize=12, bbox=dict(facecolor="black", alpha=0.7))
 
-    fig.suptitle(f"ROI curation — {z}   ·   detected {summary['n_detected']}  →  "
+    fig.suptitle(f"ROI curation: {z}   ·   detected {summary['n_detected']}  →  "
                  f"final {summary['n_final']}", fontweight="bold")
     fig.tight_layout()
     fig.savefig(path, dpi=150)

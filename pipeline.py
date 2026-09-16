@@ -439,7 +439,8 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 #
 def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
                     flow_threshold=2, cellprob_threshold=-1, diameter=15,
-                    model_type='cyto3', gpu=_USE_GPU, show_figs=True):
+                    model_type='cyto3', gpu=_USE_GPU, show_figs=True,
+                    roi_masks_override=None):
 
     """
     "method" :'max', 
@@ -450,10 +451,11 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
     "cellprob_threshold" : -1, 
     "diameter" : 15, 
     "model_type" : 'cyto',
-    'show_figs' : True   # show figures  
-    """    
+    'show_figs' : True   # show figures
+    'roi_masks_override' : None  # (h*w, N) masks to use instead of running Cellpose
+                                 # (a resumed curation); the background is still built
+    """
 
-    from cellpose import models
     import cv2 as cv
 
     func = cm.load(func_ch_file)
@@ -476,12 +478,19 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
         plt.imshow(func_lc)
 
     ###
-    model = models.CellposeModel(model_type=model_type, gpu=gpu)
-    masks, _, _ = model.eval(func_lc, diameter=diameter,
-                             flow_threshold=flow_threshold,
-                             cellprob_threshold=cellprob_threshold)
-    
-    roi_masks = np.array([(masks==i).flatten('F') for i in np.sort(np.unique(masks))[1:]]).T
+    if roi_masks_override is not None and roi_masks_override.shape[0] == func_lc.size:
+        roi_masks = np.asarray(roi_masks_override, dtype=bool)
+    else:
+        if roi_masks_override is not None:
+            print(f'  saved ROIs do not match this field of view '
+                  f'({roi_masks_override.shape[0]} vs {func_lc.size} px), running Cellpose')
+        from cellpose import models
+        model = models.CellposeModel(model_type=model_type, gpu=gpu)
+        masks, _, _ = model.eval(func_lc, diameter=diameter,
+                                 flow_threshold=flow_threshold,
+                                 cellprob_threshold=cellprob_threshold)
+
+        roi_masks = np.array([(masks==i).flatten('F') for i in np.sort(np.unique(masks))[1:]]).T
 
     #create image with masks for GUI purposes
     roi_img_bkg = (func_lc*190 // func_lc.max()).astype(np.uint8)
@@ -651,7 +660,11 @@ def _visualize_src_extraction_results(self, idx=[41]):
 
 
 @capture_args
-def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, neuron_viewer_fn=None, **kwargs):
+def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, neuron_viewer_fn=None,
+                      initial_rois_fn=None, **kwargs):
+    """initial_rois_fn(output_dir, z) -> (h*w, N) masks or None.  When it returns
+    masks, Cellpose is skipped and the ROI editor starts from them (resuming a
+    previous curation)."""
 
     import glob 
 
@@ -722,7 +735,11 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     mc_corr_file = rigcorr_results_filenames[ch_dict['mc_ch']] 
     func_corr_file = rigcorr_results_filenames[ch_dict['func_ch']] 
 
-    _idroi = {**idroi_params, 'show_figs': False} if roi_editor_fn is not None else idroi_params
+    _idroi = {**idroi_params, 'show_figs': False} if roi_editor_fn is not None else dict(idroi_params)
+    if initial_rois_fn is not None:
+        _saved = initial_rois_fn(output_dir, z)
+        if _saved is not None:
+            _idroi['roi_masks_override'] = _saved
     roi_masks, _, roi_img_bkg, roi_img_mask, func_lc = _identify_rois(output_dir, func_corr_file, z, **_idroi)
 
     if roi_editor_fn is not None:

@@ -20,19 +20,23 @@ class ROIEditorWindow(ctk.CTkToplevel):
     _REGION    = "region"
     _SUBREGION = "subregion"
 
-    # Reference-panel LUTs.  The middle button is relabelled to the selected
-    # channel's own LUT — "Red" on the structural channel, "Green" on the
-    # functional one — so one three-way control serves both.
+    # Reference-panel LUT button labels.
     _GRAY  = "Gray"
     _MERGE = "Merge"
     _RED   = "Red"
     _GREEN = "Green"
-    _PLANE = {_RED: 0, _GREEN: 1}          # LUT name → RGB plane index
 
-    # internal LUT modes, independent of the middle button's current label
+    # internal LUT modes.  Gray shows the dropdown's channel; Red is always the
+    # structural channel (tdTomato) and Green always the functional one (GCaMP),
+    # whatever the dropdown is on; Merge overlays the two.
     _LUT_GRAY  = "gray"
-    _LUT_CH    = "channel"
+    _LUT_RED   = "red"
+    _LUT_GREEN = "green"
     _LUT_MERGE = "merge"
+
+    # polygon editing hit radii, in canvas pixels
+    _VTX_HIT  = 9
+    _EDGE_HIT = 6
 
     # Reference-panel temporal statistic.  Applies to the LEFT panel only — the
     # functional image on the right (and the green half of Merge) keeps whatever
@@ -60,14 +64,25 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "LEFT-CLICK to place polygon vertices around the region to KEEP "
             "(e.g. draw around the DVC).\n\n"
             "RIGHT-CLICK to close the polygon.\n\n"
-            "Neurons whose centres fall outside are removed."
+            "Neurons whose centres fall outside are removed.\n\n"
+            "Adjust while drawing:\n"
+            "• drag a vertex to move it\n"
+            "• Shift+click an edge to insert a vertex\n"
+            "• Shift+right-click a vertex to delete it\n"
+            "• Undo / Ctrl+Z / Backspace: remove the last step\n"
+            "• Esc: cancel the polygon"
         ),
         "subregion": (
             "Outline the AREA POSTREMA (yellow).\n\n"
             "LEFT-CLICK to place vertices. RIGHT-CLICK to confirm.\n\n"
-            "Every kept neuron outside the AP outline is NTS — excluded "
+            "Every kept neuron outside the AP outline is NTS, excluded "
             "neurons are already gone.\n\n"
-            "Undo clears the outline so it can be redrawn.\n\n"
+            "Adjust at any time, also after confirming:\n"
+            "• drag a vertex to move it\n"
+            "• click an edge to insert a vertex (Shift+click while drawing)\n"
+            "• right-click a vertex to delete it (Shift+right-click while drawing)\n"
+            "• Undo / Ctrl+Z: one step back (a confirmed outline reopens)\n"
+            "• Backspace: remove the last point · Esc: cancel drawing\n\n"
             "Reference Panel below sets what the left image shows."
         ),
     }
@@ -132,7 +147,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         # red, matching the old behaviour.
         self._ch_luts   = dict(channel_luts or {})
         self._struct_ch = channel_default      # the red/structural channel
-        self._lut_mode  = self._LUT_CH
+        self._func_ch   = next((c for c, l in self._ch_luts.items() if l == self._GREEN), None)
+        self._lut_mode  = self._LUT_RED
 
         # neuron-density overlay (AP/NTS boundary criterion 1)
         self._cent_cache = None
@@ -171,7 +187,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._ap_ids  = []         # (canvas, item_id) pairs
         self._ap_mask = None       # bool (h, w) once confirmed
 
-        # ROI label image for hover lookup and outline rendering — rebuilt
+        # vertex-level undo for the polygon being edited: (mode, points, closed)
+        # snapshots taken before every point / drag / insert / delete / confirm
+        self._vtx_hist = []
+        self._drag     = None      # (vertex index, start point, inserted) while dragging
+
+        # ROI label image for hover lookup and outline rendering: rebuilt
         # lazily after any mask edit (see _invalidate_density)
         self._lab_cache     = None
         self._outline_cache = {}
@@ -373,7 +394,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
         self._ref_color_var = tk.StringVar()
         self._ref_color_btn = ctk.CTkSegmentedButton(
-            body, values=[self._GRAY, self._RED, self._MERGE],
+            body, values=[self._GRAY, self._RED, self._GREEN, self._MERGE],
             variable=self._ref_color_var, command=self._on_lut_change)
         self._ref_color_btn.pack(padx=10, pady=(4, 2), fill="x")
 
@@ -410,6 +431,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
         self._sync_lut_buttons()
 
+        # keyboard shortcuts for polygon drawing
+        self.bind("<Control-z>", lambda _e: self._undo())
+        self.bind("<Control-Z>", lambda _e: self._undo())
+        self.bind("<BackSpace>", lambda _e: self._remove_last_vertex())
+        self.bind("<Escape>",    lambda _e: self._cancel_polygon())
+
         self.protocol("WM_DELETE_WINDOW", self._do_finish)
 
     # ── mode ──────────────────────────────────────────────────────────────────
@@ -421,6 +448,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._delete_ids(self._poly_ids)
         self._poly_pts = []
         self._poly_ids = []
+        self._vtx_hist = []
+        self._drag     = None
 
         # an unconfirmed AP outline is dropped on a mode switch; a confirmed one
         # survives
@@ -457,44 +486,49 @@ class ROIEditorWindow(ctk.CTkToplevel):
     def _update_ref_label(self):
         if not hasattr(self, '_lbl_ref'):
             return
-        if self._mc_bkg is not None:
-            ch  = self._ch_cur or "structural"
-            lut = (self._MERGE if self._lut_mode == self._LUT_MERGE else
-                   self._GRAY  if self._lut_mode == self._LUT_GRAY  else
-                   self._lut_for(self._ch_cur))
-            txt = (f"Reference — {ch} · {self._stat_cur} · {lut}"
-                   + (f"  ({self._ch_note})" if self._ch_note else ""))
-        else:
+        mode = self._lut_mode
+        if mode == self._LUT_GREEN:
+            txt = f"Reference: {self._func_ch or 'functional'} (GCaMP) · Green"
+        elif self._mc_bkg is None:
             txt = "Reference  (no ROIs)"
+        elif mode == self._LUT_MERGE:
+            txt = (f"Reference: {self._struct_ch or 'structural'} + "
+                   f"{self._func_ch or 'functional'} · {self._stat_cur} · Merge")
+        elif mode == self._LUT_RED:
+            txt = f"Reference: {self._struct_ch or 'structural'} (tdTomato) · {self._stat_cur} · Red"
+        else:
+            txt = (f"Reference: {self._ch_cur or 'structural'} · {self._stat_cur} · Gray"
+                   + (f"  ({self._ch_note})" if self._ch_note else ""))
         self._lbl_ref.configure(text=txt)
 
-    def _lut_for(self, ch):
-        """LUT name for a channel — red unless the rig put it on the green PMT."""
-        return self._ch_luts.get(ch, self._RED)
+    _LUT_LABEL = {"gray": "Gray", "red": "Red", "green": "Green", "merge": "Merge"}
 
     def _sync_lut_buttons(self):
-        """Relabel the middle button to the selected channel's own LUT.
-
-        Keeps one three-way control for both channels: it reads Gray / Red /
-        Merge on the structural channel and Gray / Green / Merge on the
-        functional one, without the selected mode changing underneath the user.
-        """
-        ch_lbl = self._lut_for(self._ch_cur)
-        self._ref_color_btn.configure(values=[self._GRAY, ch_lbl, self._MERGE])
-        self._ref_color_var.set({self._LUT_GRAY:  self._GRAY,
-                                 self._LUT_MERGE: self._MERGE}.get(self._lut_mode, ch_lbl))
+        """Point the LUT buttons at the current mode and refresh the caption."""
+        self._ref_color_var.set(self._LUT_LABEL[self._lut_mode])
         self._lut_caption.configure(
-            text=f"{ch_lbl} LUT, as Prairie View shows that PMT.  "
-                 f"Merge overlays both channels.\n"
+            text="Gray: the channel in the dropdown.  Red: tdTomato.  "
+                 "Green: GCaMP.  Merge: both.\n"
                  "Mean: best SNR on a static label.  P99: matches the "
                  "functional panel.\nLeft panel only.")
 
     def _on_lut_change(self, value):
-        self._lut_mode = (self._LUT_GRAY  if value == self._GRAY else
-                          self._LUT_MERGE if value == self._MERGE else
-                          self._LUT_CH)
+        self._lut_mode = {v: k for k, v in self._LUT_LABEL.items()}.get(value, self._LUT_RED)
         self._update_ref_label()
         self._refresh_canvas()
+
+    def _func_ref_bright(self):
+        """Functional channel (GCaMP) with the reference panel's own contrast.
+
+        Uses the dropdown's loaded projection of the functional channel when one
+        is cached (so Mean / P99 apply), otherwise the functional image the ROI
+        panel shows.  Never triggers a load.
+        """
+        stat = self._STAT.get(self._stat_var.get(), "mean")
+        img = None
+        if self._func_ch is not None:
+            img = self._ch_cache.get((self._func_ch, stat), (None, ""))[0]
+        return self._ref_stretch(img if img is not None else self._roi_bkg)
 
     def _apply_ref_lut(self, ref, func):
         """Colourise the reference panel.
@@ -512,8 +546,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
             return ref
 
         out = np.zeros_like(ref)
-        if self._lut_mode == self._LUT_CH:
-            out[..., self._PLANE.get(self._lut_for(self._ch_cur), 0)] = ref[..., 0]
+        if self._lut_mode == self._LUT_RED:
+            struct = ref if self._ch_cur == self._struct_ch else self._struct_bright()
+            out[..., 0] = (struct if struct is not None else ref)[..., 0]
+            return out
+        if self._lut_mode == self._LUT_GREEN:
+            out[..., 1] = self._func_ref_bright()[..., 0]
             return out
 
         # Merge: structural red + functional green, whichever channel the
@@ -803,8 +841,22 @@ class ROIEditorWindow(ctk.CTkToplevel):
         return PILImage.fromarray(arr)
 
     def _on_motion(self, event):
+        self._hover_neuron(event)
+        # polygon handles: move cursor on a vertex, insert cursor on an edge
+        pts, closed = self._active_poly()
+        if pts:
+            cv = event.widget
+            if self._vertex_at(cv, event.x, event.y) is not None:
+                cv.configure(cursor="fleur")
+            elif self._edge_at(cv, event.x, event.y) is not None and (
+                    closed or getattr(event, "state", 0) & 0x0001):
+                cv.configure(cursor="plus")
+            elif self._mode != self._REMOVE:
+                cv.configure(cursor="")
+
+    def _hover_neuron(self, event):
         if self._mode == self._ADD and self._new_mask is not None:
-            return                                  # painting — stay out of the way
+            return                                  # painting: stay out of the way
         ix, iy = self._c2i_on(event.widget, event.x, event.y)
         col, cnt = self._col_at(ix, iy)
         sid = int(self._ids[col]) if col >= 0 else None
@@ -822,7 +874,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
         if self._ap_mask is not None:
             r, c = self._roi_centre(col)
             where = "  ·  AP" if self._ap_mask[r, c] else "  ·  NTS"
-        extra  = f"  ·  {cnt} overlapping — the smallest is picked" if cnt > 1 else ""
+        extra  = f"  ·  {cnt} overlapping: the smallest is picked" if cnt > 1 else ""
         action = "  ·  right-click to remove" if self._mode == self._REMOVE else ""
         self._hover_lbl.configure(
             text=f"● Neuron #{sid} ({origin}, {size} px){where}{extra}{action}",
@@ -918,6 +970,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         # reference could not be loaded.
         if self._mc_bkg is not None:
             ref_bright = self._apply_ref_lut(self._ref_stretch(self._mc_bkg), func_bright)
+        elif self._lut_mode == self._LUT_GREEN:
+            ref_bright = self._apply_ref_lut(func_bright, func_bright)
         else:
             ref_bright = func_bright
 
@@ -1024,10 +1078,25 @@ class ROIEditorWindow(ctk.CTkToplevel):
                 text=f"Removed #{sid}. Total: {self._roi_masks.shape[1]}")
             self._refresh_canvas()
             self._on_motion(event)          # show what is under the cursor now
-        elif self._mode == self._REGION:
+            return
+
+        pts, closed = self._active_poly()
+        if pts is None:
+            return
+        # right-click on a vertex deletes it: plain right-click once the AP is
+        # confirmed (closing is no longer its job), Shift+right-click while drawing
+        shift = getattr(event, "state", 0) & 0x0001
+        k = self._vertex_at(event.widget, event.x, event.y)
+        if k is not None and (closed or shift):
+            self._delete_vertex(k)
+            return
+        if self._mode == self._REGION:
             self._close_polygon()
-        elif self._mode == self._SUBREGION:
+        elif not closed and len(self._ap_pts) >= 3:
+            self._snapshot_poly()
             self._sreg_close_region()
+        else:
+            self._sreg_close_region()       # reports "need 3 points" / no-op
 
     # ── add ───────────────────────────────────────────────────────────────────
 
@@ -1036,14 +1105,51 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._new_mask = np.zeros((self._ih, self._iw), dtype=bool)
             self._add_col  = tuple(np.random.randint(40, 210, 3).tolist())
             self._paint(event.widget, event.x, event.y)
-        elif self._mode == self._REGION:
-            self._add_poly_pt(*self._c2i_on(event.widget, event.x, event.y))
-        elif self._mode == self._SUBREGION:
-            self._sreg_add_pt(*self._c2i_on(event.widget, event.x, event.y))
+            return
+
+        pts, closed = self._active_poly()
+        if pts is None:
+            return
+        cv, x, y = event.widget, event.x, event.y
+        shift = getattr(event, "state", 0) & 0x0001
+
+        # grab an existing vertex
+        k = self._vertex_at(cv, x, y)
+        if k is not None:
+            self._snapshot_poly()
+            self._drag = (k, pts[k], False)
+            return
+
+        # insert on an edge: plain click on a confirmed outline, Shift while drawing
+        e = self._edge_at(cv, x, y)
+        if e is not None and (closed or shift):
+            self._snapshot_poly()
+            pts.insert(e, self._c2i_on(cv, x, y))
+            self._drag = (e, None, True)
+            self._redraw_polys()
+            return
+
+        if closed:
+            self._status.configure(
+                text="AP is confirmed. Drag a vertex to move it, click an edge to "
+                     "add one, right-click a vertex to delete it, Undo to reopen.")
+            return
+
+        self._snapshot_poly()
+        if self._mode == self._REGION:
+            self._add_poly_pt(*self._c2i_on(cv, x, y))
+        else:
+            self._sreg_add_pt(*self._c2i_on(cv, x, y))
 
     def _on_left_mv(self, event):
         if self._mode == self._ADD and self._new_mask is not None:
             self._paint(event.widget, event.x, event.y)
+        elif self._drag is not None:
+            pts, _ = self._active_poly()
+            ix, iy = self._c2i_on(event.widget, event.x, event.y)
+            pts[self._drag[0]] = (min(max(ix, 0), self._iw - 1),
+                                  min(max(iy, 0), self._ih - 1))
+            self._redraw_polys()
 
     def _paint(self, canvas, cx, cy):
         ix, iy = self._c2i_on(canvas, cx, cy)
@@ -1060,6 +1166,15 @@ class ROIEditorWindow(ctk.CTkToplevel):
                            fill=col, outline=col, tags="paint")
 
     def _on_left_up(self, event):
+        if self._drag is not None:
+            k, start, inserted = self._drag
+            self._drag = None
+            pts, _ = self._active_poly()
+            if not inserted and pts[k] == start:
+                self._vtx_hist.pop()          # a click on a vertex, not a move
+                return
+            self._poly_changed("Vertex added." if inserted else "Vertex moved.")
+            return
         if self._mode != self._ADD or self._new_mask is None:
             return
         if not self._new_mask.any():
@@ -1116,10 +1231,17 @@ class ROIEditorWindow(ctk.CTkToplevel):
             keep[i] = inside[int(ys.mean()), int(xs.mean())]
 
         removed = int((~keep).sum())
-        if removed > 0 and messagebox.askyesno(
+        if removed > 0 and not messagebox.askyesno(
                 "Exclude region",
                 f"Remove {removed} neuron(s) outside the polygon?",
                 parent=self):
+            # keep the outline so it can be adjusted and applied again
+            self._redraw_polys()
+            self._status.configure(
+                text="Polygon kept. Adjust it, then right-click to apply again "
+                     "(Esc cancels).")
+            return
+        if removed > 0:
             self._push_history()
             for i in np.where(~keep)[0]:
                 pxs = self._roi_masks[:, i].reshape((self._ih, self._iw), order='F')
@@ -1141,11 +1263,129 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._excl_polys.append(list(self._poly_pts))
             self._keep_mask = self._keep_mask & inside
             self._status.configure(
-                text="All neurons are inside the polygon — area recorded.")
+                text="All neurons are inside the polygon: area recorded.")
 
         self._delete_ids(self._poly_ids)
         self._poly_ids = []
         self._poly_pts = []
+        # the exclusion is applied; undoing it now goes through the mask history
+        self._vtx_hist = []
+
+    # ── polygon editing (exclusion polygon and AP outline) ────────────────────
+
+    def _active_poly(self):
+        """(vertex list, closed) of the polygon the current mode edits.
+
+        The list is the live one, so callers can edit it in place.  (None, False)
+        in modes without a polygon.
+        """
+        if self._mode == self._REGION:
+            return self._poly_pts, False
+        if self._mode == self._SUBREGION:
+            return self._ap_pts, self._ap_mask is not None
+        return None, False
+
+    def _snapshot_poly(self):
+        """Save the polygon's state before an edit, for one-step undo."""
+        pts, closed = self._active_poly()
+        if pts is None:
+            return
+        self._vtx_hist.append((self._mode, list(pts), closed))
+        if len(self._vtx_hist) > 200:
+            self._vtx_hist.pop(0)
+
+    def _vertex_at(self, canvas, cx, cy):
+        """Index of the vertex under a canvas point, or None."""
+        pts, _ = self._active_poly()
+        best, best_d = None, self._VTX_HIT
+        for k, p in enumerate(pts or []):
+            x, y = self._i2c_on(canvas, *p)
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = k, d
+        return best
+
+    def _edge_at(self, canvas, cx, cy):
+        """Insert position (index of the edge's end vertex) for an edge under a
+        canvas point, or None.  The closing edge counts once the AP is confirmed."""
+        pts, closed = self._active_poly()
+        n = len(pts or [])
+        if n < 2:
+            return None
+        edges = list(range(n - 1)) + ([n - 1] if closed and n >= 3 else [])
+        best, best_d = None, self._EDGE_HIT
+        for k in edges:
+            x0, y0 = self._i2c_on(canvas, *pts[k])
+            x1, y1 = self._i2c_on(canvas, *pts[(k + 1) % n])
+            dx, dy = x1 - x0, y1 - y0
+            seg = dx * dx + dy * dy
+            t = 0.0 if seg == 0 else max(0.0, min(1.0, ((cx - x0) * dx + (cy - y0) * dy) / seg))
+            d = ((x0 + t * dx - cx) ** 2 + (y0 + t * dy - cy) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = k + 1, d
+        return best
+
+    def _poly_changed(self, msg=""):
+        """Redraw after a vertex edit; a confirmed AP also gets its mask and the
+        AP / NTS assignment rebuilt."""
+        self._redraw_polys()
+        if self._mode == self._SUBREGION and self._ap_mask is not None:
+            self._ap_mask = self._poly_mask(self._ap_pts)
+            self._outline_cache = {}
+            n_ap, n_nts = self._sreg_counts()
+            msg = f"{msg}  AP: {n_ap}   NTS: {n_nts}".strip()
+            self._refresh_canvas()
+        else:
+            pts, _ = self._active_poly()
+            msg = f"{msg}  {len(pts or [])} point(s).".strip()
+        self._status.configure(text=msg)
+
+    def _delete_vertex(self, k):
+        pts, closed = self._active_poly()
+        if closed and len(pts) <= 3:
+            self._status.configure(
+                text="An outline needs at least 3 vertices. Undo reopens it instead.")
+            return
+        self._snapshot_poly()
+        del pts[k]
+        self._poly_changed("Vertex deleted.")
+
+    def _remove_last_vertex(self):
+        pts, closed = self._active_poly()
+        if not pts or closed:
+            return
+        self._snapshot_poly()
+        pts.pop()
+        self._poly_changed("Last point removed.")
+
+    def _cancel_polygon(self):
+        pts, closed = self._active_poly()
+        if not pts or closed:
+            return
+        self._snapshot_poly()
+        pts.clear()
+        self._poly_changed("Drawing cancelled (Undo brings it back).")
+
+    def _undo_poly(self) -> bool:
+        """Step the current polygon back one edit.  False if there is none."""
+        while self._vtx_hist and self._vtx_hist[-1][0] != self._mode:
+            self._vtx_hist.pop()                  # stale entries from another mode
+        if not self._vtx_hist:
+            return False
+        _, pts, closed = self._vtx_hist.pop()
+        if self._mode == self._REGION:
+            self._poly_pts[:] = pts
+        else:
+            self._ap_pts[:] = pts
+            was_closed = self._ap_mask is not None
+            self._ap_mask = self._poly_mask(pts) if closed and len(pts) >= 3 else None
+            self._outline_cache = {}
+            if was_closed or closed:
+                self._refresh_canvas()
+        self._redraw_polys()
+        state = "confirmed" if closed else "open"
+        self._status.configure(text=f"Undone: {len(pts)} point(s), outline {state}.")
+        return True
 
     # ── sub-region definition (AP outline; NTS = the rest) ────────────────────
 
@@ -1177,12 +1417,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._outline_cache = {}
         n_ap, n_nts = self._sreg_counts()
         self._status.configure(
-            text=f"AP confirmed — AP: {n_ap}   NTS: {n_nts} neuron(s).  "
+            text=f"AP confirmed.  AP: {n_ap}   NTS: {n_nts} neuron(s).  "
                  "Yellow outlines are AP, cyan are NTS.")
         self._refresh_canvas()
 
     def _sreg_counts(self):
-        """(in AP, NTS) by ROI centre — the same test get_region_labels applies
+        """(in AP, NTS) by ROI centre: the same test get_region_labels applies
         downstream, so the numbers shown here are the numbers the analysis uses."""
         cents = self._centroids()
         if self._ap_mask is None or not len(cents):
@@ -1202,6 +1442,12 @@ class ROIEditorWindow(ctk.CTkToplevel):
             self._history.pop(0)
 
     def _undo(self):
+        if self._drag is not None:
+            return
+        # while a polygon is being edited, Undo steps back one vertex edit;
+        # only once there are none left does it undo neuron edits
+        if self._mode in (self._REGION, self._SUBREGION) and self._undo_poly():
+            return
         if self._mode == self._SUBREGION:
             self._sreg_undo()
             return
@@ -1215,6 +1461,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._refresh_canvas()
 
     def _sreg_undo(self):
+        """No step history left (e.g. an outline restored from a previous
+        curation): clear the whole outline."""
         if not self._ap_pts and self._ap_mask is None:
             self._status.configure(text="Nothing to undo.")
             return
@@ -1225,7 +1473,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
         self._ap_mask = None
         self._outline_cache = {}
         self._status.configure(
-            text="AP outline removed — redraw it." if confirmed
+            text="AP outline removed: redraw it." if confirmed
                  else "AP drawing cleared.")
         self._refresh_canvas()
 
@@ -1236,8 +1484,8 @@ class ROIEditorWindow(ctk.CTkToplevel):
             ans = messagebox.askyesnocancel(
                 "AP outline not confirmed",
                 f"The AP outline on {self._z} was drawn but not confirmed "
-                "(right-click).\n\nYes — confirm it and finish\n"
-                "No — discard it\nCancel — keep editing",
+                "(right-click).\n\nYes: confirm it and finish\n"
+                "No: discard it\nCancel: keep editing",
                 parent=self)
             if ans is None:
                 return False
@@ -1280,6 +1528,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
             initial_labels=self._initial_labels,
             final_labels=final_labels,
             final_ids=[int(i) for i in ids],
+            final_masks=self._roi_masks[:, nonempty],
             removal_reason=dict(self._removal_reason),
             exclusion_polygons=[list(p) for p in self._excl_polys],
             keep_mask=self._keep_mask.copy(),
@@ -1311,7 +1560,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
             "roi_style":  self._roi_style_var.get(),
             "ref_outlines": bool(self._ref_outline_var.get()),
         }
-        # (AP, NTS): NTS is every pixel outside the AP — excluded neurons are
+        # (AP, NTS): NTS is every pixel outside the AP: excluded neurons are
         # already gone, so whatever is left there is NTS
         sreg = ([self._ap_mask, ~self._ap_mask] if self._ap_mask is not None
                 else None)

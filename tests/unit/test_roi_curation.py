@@ -118,7 +118,7 @@ class TestSaveAndYield:
         ac = s["after_curation"]
         assert ac["detected"]["count"] == {"AP": 1, "NTS": 0, "total": 1}
         assert ac["added"]["count"] == {"AP": 0, "NTS": 1, "total": 1}
-        # detected neuron 2 sits outside the kept area — not in the before count
+        # detected neuron 2 sits outside the kept area: not in the before count
         assert s["detected_before_curation"]["count"]["total"] == 2
         assert s["area_px"]["AP"] == int(rec["ap_mask"].sum())
         d = tmp_path / "z1" / "roi_curation"
@@ -169,6 +169,28 @@ class TestSaveAndYield:
         text = path.read_text()
         assert "traces,added" in text
         assert (tmp_path / "roi_curation_yield.png").exists()
+
+    def test_resume_uses_exact_masks(self, tmp_path):
+        from analysis.roi_curation import load_curated_masks
+        rec, det, added = _record(tmp_path)
+        # overlapping final ROIs: the label image alone could not restore these
+        big = _square(5, 5, 10)
+        rec.update(final_masks=_masks([big, added]),
+                   final_labels=label_image(_masks([big, added]), H, W, ids=[0, 3])[0])
+        save_curation(tmp_path / "z1", "z1", rec)
+        masks, r = load_curated_masks(tmp_path / "z1", "z1")
+        np.testing.assert_array_equal(masks, rec["final_masks"])
+        assert r["final_ids"] == [0, 3]
+        assert load_curated_masks(tmp_path / "z1", "z1", n_pixels=H * W + 1) is None
+
+    def test_resume_rebuilds_from_labels_for_old_records(self, tmp_path):
+        from analysis.roi_curation import load_curated_masks
+        rec, det, added = _record(tmp_path)          # no final_masks, like an old record
+        save_curation(tmp_path / "z1", "z1", rec)
+        masks, r = load_curated_masks(tmp_path / "z1", "z1")
+        np.testing.assert_array_equal(masks, _masks([det[0], added]))
+        assert r["final_ids"] == [0, 3]
+        assert load_curated_masks(tmp_path / "z2", "z2") is None
 
     def test_no_ap(self, tmp_path):
         rec, _, _ = _record(tmp_path)
