@@ -523,7 +523,10 @@ def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
 def get_region_labels(provenance, subregion_dir):
     """
     Return int array (N_neurons,) with neuron-to-region assignments:
-      0 = Region A, 1 = Region B, -1 = unclassified / no sub-region file.
+      0 = AP, 1 = NTS, -1 = unclassified / no sub-region file.
+    The ROI editor saves (AP, not-AP) masks, so every neuron on a plane with an
+    AP outline is classified; -1 only remains for planes without one (or for
+    older files that held two separately drawn regions).
     Neuron ordering matches get_stims1_stims2 output for the same provenance.
     """
     from caiman.source_extraction.cnmf import cnmf as cnmf_module
