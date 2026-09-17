@@ -190,6 +190,8 @@ class _TracePopout(ctk.CTkToplevel):
     ) -> None:
         """Redraw both axes for neuron n."""
         status = 'Accepted ✓' if n.accepted else 'Rejected ✗'
+        if n.passed_qc is False:
+            status += '   (failed CaImAn check)'
         self._title_lbl.configure(
             text=f'Neuron {neuron_idx + 1}  —  {status}')
 
@@ -226,6 +228,65 @@ class _TracePopout(ctk.CTkToplevel):
         self._canvas.draw_idle()
 
 
+# ── CaImAn quality-check summary ──────────────────────────────────────────────
+
+_QC_PASS_COLOR = '#50c850'
+_QC_FAIL_COLOR = '#e05050'
+
+
+def _qc_summary(n: Neuron, neurons: list[Neuron], thr: dict) -> tuple[str, str]:
+    """Label text and colour for CaImAn's quality check of neuron n.
+
+    thr : CaImAn thresholds, keys min_SNR, rval_thr, SNR_lowest, rval_lowest
+          (any may be absent).
+    """
+    min_snr, rval_thr, snr_low = thr.get('min_SNR'), thr.get('rval_thr'), thr.get('SNR_lowest')
+    r_low = thr.get('rval_lowest')
+
+    scores = []
+    if n.snr is not None:
+        rule = [f'pass > {min_snr:g}'] if min_snr is not None else []
+        if snr_low is not None:
+            rule.append(f'fail ≤ {snr_low:g}')
+        scores.append(f'SNR  {n.snr:.2f}' + (f'   ({", ".join(rule)})' if rule else ''))
+    if n.r_value is not None:
+        scores.append(f'r  {n.r_value:.2f}' + (f'   (pass ≥ {rval_thr:g})' if rval_thr is not None else ''))
+
+    if n.passed_qc is None:
+        head = 'CaImAn check: no verdict saved' if scores else 'CaImAn check: not available'
+        return '\n'.join([head, *scores]), 'gray'
+
+    if n.passed_qc:
+        lines, color = ['CaImAn check: passed'], _QC_PASS_COLOR
+    else:
+        lines, color = ['CaImAn check: FAILED  (starts rejected)'], _QC_FAIL_COLOR
+        reason = _fail_reason(n, min_snr, rval_thr, snr_low, r_low)
+        if reason:
+            lines.append(reason)
+
+    n_fail = sum(1 for nn in neurons if nn.passed_qc is False)
+    lines += scores + [f'{n_fail} / {len(neurons)} failed on this plane']
+    return '\n'.join(lines), color
+
+
+def _fail_reason(n: Neuron, min_snr, rval_thr, snr_low, r_low) -> str | None:
+    """Why CaImAn failed n, stated only when the saved scores show it.
+
+    CaImAn fails a component if SNR <= SNR_lowest or r <= rval_lowest (an
+    undefined correlation is stored as -1), or if it passes neither
+    SNR > min_SNR nor r >= rval_thr (nor the CNN classifier, when enabled).
+    """
+    snr, r = n.snr, n.r_value
+    if snr is not None and snr_low is not None and snr <= snr_low:
+        return f'SNR at or below the {snr_low:g} floor'
+    if r is not None and r_low is not None and r <= r_low:
+        return f'spatial correlation at or below {r_low:g} (undefined)'
+    if (snr is not None and r is not None and min_snr is not None and rval_thr is not None
+            and snr <= min_snr and r < rval_thr):
+        return f'SNR not above {min_snr:g} and r below {rval_thr:g}'
+    return 'scores alone do not explain it (e.g. CNN classifier)'
+
+
 # ── main viewer window ────────────────────────────────────────────────────────
 
 class NeuronViewerWindow(ctk.CTkToplevel):
@@ -243,6 +304,8 @@ class NeuronViewerWindow(ctk.CTkToplevel):
     on_close     : callback(is_cell: np.ndarray) called when the window closes
     timing_info  : optional dict with keys fp, pre_f, base_f, stim_f,
                    session_lengths — enables trace region annotations
+    qc_thresholds: optional dict with keys min_SNR, rval_thr, SNR_lowest —
+                   CaImAn quality-check thresholds shown next to each neuron's scores
     """
 
     def __init__(
@@ -253,6 +316,7 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         frame_period: float = 0.033,
         on_close=None,
         timing_info: dict | None = None,
+        qc_thresholds: dict | None = None,
     ):
         super().__init__(parent)
         self.title("Neuron Viewer — Post-CNMF Curation")
@@ -262,6 +326,7 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         self._fp          = frame_period
         self._on_close_cb = on_close
         self._timing_info    = timing_info
+        self._qc_thr         = qc_thresholds or {}
         self._selected       = 0
         self._legend_visible = False
         self._popout: _TracePopout | None = None
@@ -379,6 +444,12 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         self._cell_label = ctk.CTkLabel(
             right, text='', font=ctk.CTkFont(size=13, weight='bold'))
         self._cell_label.pack(pady=(10, 4), padx=12)
+
+        # CaImAn quality-check verdict and scores for the selected neuron
+        self._qc_label = ctk.CTkLabel(
+            right, text='', font=ctk.CTkFont(size=11),
+            justify='left', anchor='w')
+        self._qc_label.pack(anchor='w', padx=12, pady=(0, 4))
 
         # Navigation
         nav = ctk.CTkFrame(right, fg_color='transparent')
@@ -540,6 +611,9 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         self._cell_label.configure(
             text=f'Neuron  {k + 1}  /  {K}     ({n_acc} accepted)')
 
+        qc_text, qc_color = _qc_summary(n, self._neurons, self._qc_thr)
+        self._qc_label.configure(text=qc_text, text_color=qc_color)
+
         if n.accepted:
             self._accept_btn.configure(fg_color='#1a7a1a', text='✓  Accepted')
             self._reject_btn.configure(fg_color='#7a1a1a', text='Reject ✗')
@@ -581,13 +655,13 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         self._anim_t_vals    = self._anim_t_indices * self._fp
         self._anim_frame_idx = 0
 
-        # Neuron statistics
+        # Neuron statistics.  Peak/SD is a quick display measure, not CaImAn's SNR
         area = int((n.spatial > n.spatial.max() * 0.05).sum())
         cy, cx = n.centroid
-        snr  = float(n.trace_raw.max() / (n.trace_raw.std() + 1e-9))
+        peak_sd = float(n.trace_raw.max() / (n.trace_raw.std() + 1e-9))
         peak = float(n.trace_raw.max())
         self._info_label.configure(
-            text=f'Centroid: ({cx}, {cy})   Area: {area} px   Peak: {peak:.1f}   SNR: {snr:.1f}')
+            text=f'Centroid: ({cx}, {cy})   Area: {area} px   Peak: {peak:.1f}   Peak/SD: {peak_sd:.1f}')
 
         self._refresh_image()
 

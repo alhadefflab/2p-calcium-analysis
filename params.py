@@ -71,15 +71,17 @@ IDROI_PARAMS = {
 }
 
 
-#set parameters for source extraction
+#set parameters for source extraction (defaults for pipeline._run_cnmf)
+# 'fr' is deliberately absent: it is the imaging rate per plane, 1 / frame period,
+# and is passed at run time from the GUI's frame period (runcnmf_params)
 CNMF_PARAMS = {
-    'fr': MCVID_PARAMS['fr'],
     'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
     'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
-    'nb': 2, # the number of background components, 
+    'nb': 2, # the number of background components,
     'rf': None, #must be None for seeded mode
     'only_init':False, #must be false for seeded mode
-    'min_SNR': 2.0,
+    'min_SNR': 2.0,      # quality check: components with transient SNR above this pass
+    'rval_thr': 0.8,     # quality check: components with spatial correlation at or above this pass
     'use_cnn': False,    # set True to enable PyTorch CNN quality classifier (requires new CaImAn)
     'use_cuda': USE_GPU,
 

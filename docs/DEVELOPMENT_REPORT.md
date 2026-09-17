@@ -136,10 +136,15 @@ Y  ≈  A C  +  b f  +  ε
   slow indicator GCaMP6s), capturing the fast rise / slow exponential decay of a
   calcium transient (`decay_time = 1.8 s`).
 
-After fitting, components are quality-controlled with
-`evaluate_components` + `select_components` (SNR floor `min_SNR = 2.0`, spatial
-footprint consistency, optional CNN classifier) to drop noise and neuropil before
-traces are saved.
+After fitting, `evaluate_components` scores every component: transient SNR over a
+window of `ceil(fr × decay_time)` frames, and spatial correlation of the footprint
+with the movie around activity peaks. A component passes if `r ≥ 0.8` or
+`SNR > 2.0`, and always fails if `SNR ≤ 0.5`. `fr` is the imaging rate per plane
+(1 / frame period, 1.71 Hz here), passed from the GUI. No component is deleted:
+the scores and pass/fail lists are saved with the CNMF file, and failing
+components start rejected in the neuron viewer for review. (Earlier runs used
+`select_components`, which moved failures to `estimates.discarded_components`,
+and ran with CaImAn's default `fr = 30`.)
 
 ### 1.5 ΔF/F and z-scoring (`custom_df_f`, `custom_df_f_startend`)
 

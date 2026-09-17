@@ -344,6 +344,16 @@ class PipelineGUI(ctk.CTk):
         self._check_provenance()
         self.tabs.set("Run")
 
+    def _sync_resume_curation(self):
+        """Resume is a sub-option of CNMF: disabled and unticked while CNMF is off."""
+        if not hasattr(self, "resume_curation"):
+            return
+        if self.do_cnmf.get():
+            self.resume_curation.configure(state="normal")
+        else:
+            self.resume_curation.deselect()
+            self.resume_curation.configure(state="disabled")
+
     def _check_provenance(self):
         if not hasattr(self, "do_mc"):
             return
@@ -370,6 +380,8 @@ class PipelineGUI(ctk.CTk):
             parts.append("CNMF ✓")
         else:
             self.do_cnmf.select()
+        # select()/deselect() do not fire the checkbox command
+        self._sync_resume_curation()
 
         results_dir = Path(project_dir) / "analysis"
         if (results_dir / "resp1.npy").exists():
@@ -592,7 +604,8 @@ class PipelineGUI(ctk.CTk):
 
         self.do_cnmf = ctk.CTkCheckBox(
             stages,
-            text="Source extraction / CNMF,  slow, opens interactive ROI editor, skip if already done")
+            text="Source extraction / CNMF,  slow, opens interactive ROI editor, skip if already done",
+            command=self._sync_resume_curation)
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
@@ -601,6 +614,7 @@ class PipelineGUI(ctk.CTk):
             text="Resume previous ROI curation,  reopen the editor with the neurons you "
                  "added / removed last time instead of a fresh Cellpose detection")
         self.resume_curation.pack(anchor="w", padx=40, pady=(0, 4))
+        self._sync_resume_curation()
 
         self.do_subregion_setup = ctk.CTkCheckBox(
             stages,
@@ -1123,7 +1137,20 @@ class PipelineGUI(ctk.CTk):
 
         self._log("  Building neuron list from CNMF estimates …")
         neurons = Neuron.build_all(cnm.estimates, dims=cnm.dims)   # pure numpy, safe on worker thread
+        n_fail = sum(1 for n in neurons if n.passed_qc is False)
+        if any(n.passed_qc is not None for n in neurons):
+            self._log(f"  CaImAn check: {len(neurons) - n_fail} passed, {n_fail} failed "
+                      f"(failed start rejected; review them in the viewer)")
+        else:
+            self._log("  CaImAn check: no pass/fail saved in this CNMF file, all start accepted")
         self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
+
+        qc_thresholds = None
+        try:
+            qc_thresholds = {key: cnm.params.get('quality', key)
+                             for key in ('min_SNR', 'rval_thr', 'SNR_lowest', 'rval_lowest')}
+        except Exception:
+            pass
 
         # Build timing_info for trace annotations if we have session data
         timing_info = None
@@ -1159,6 +1186,7 @@ class PipelineGUI(ctk.CTk):
                 frame_period=getattr(self, '_current_fp', 0.033),
                 on_close=_on_close,
                 timing_info=timing_info,
+                qc_thresholds=qc_thresholds,
             )
 
         self.after(0, _show)
@@ -1341,7 +1369,8 @@ class PipelineGUI(ctk.CTk):
                         roi_editor_fn=roi_fn,
                         neuron_viewer_fn=_make_viewer_fn(z),
                         initial_rois_fn=resume_fn,
-                        idroi_params=cp)
+                        idroi_params=cp,
+                        runcnmf_params=dict(fr=1 / fp))
                     self._report_curation_yield(provenance, z)
             else:
                 self._log("  Skipping CNMF,  using saved results.")

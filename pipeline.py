@@ -572,36 +572,41 @@ def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_
 
  
 
-def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
-            rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=_USE_GPU,
+def _run_cnmf(output_dir, z, func_ch_file, roi_masks, fr, decay_time=1.8, p=2, nb=2,
+            rf=None, only_init=False, min_SNR=2.0, rval_thr=0.8, use_cnn=False, use_cuda=_USE_GPU,
             K=300, gSig=[10,10], max_processes=None):
+    """Seeded CNMF on one plane, followed by CaImAn's quality check.
 
+    fr : imaging rate of this plane in Hz (1 / frame period, 1.71 Hz for 6 planes
+         at 0.585 s).  Required: CaImAn's default of 30 Hz is wrong for volumetric
+         data.  CaImAn only uses it in the quality check, to size the transient
+         window for the SNR test (fr * decay_time frames) and the window around
+         activity peaks for the spatial correlation test.
+    max_processes : worker cap; None = cores - 1.  The actual count is sized to
+         free RAM at run time (worker_budget.py)
 
+    No component is deleted.  evaluate_components leaves SNR_comp, r_values and
+    the pass / fail index lists (idx_components, idx_components_bad) on
+    cnm.estimates, and they are saved with the CNMF file.  The neuron viewer
+    starts failing components as rejected, so they are reviewed instead of
+    silently removed.  A component passes if r >= rval_thr or SNR > min_SNR, and
+    always fails if SNR <= 0.5 (CaImAn's SNR_lowest).
     """
-    'max_processes': None, # worker cap; None = cores - 1.  The actual count is
-                           # sized to free RAM at run time (worker_budget.py)
-
-    'fr': MCVID_PARAMS['fr'],
-    'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
-    'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
-    'nb': 2, # the number of background components, 
-    'rf': None, #must be None for seeded mode
-    'only_init':False, #must be false for seeded mode
-    'min_SNR': 2.0,
-    'use_cnn': False, # whether or not to use a convolutional neural network to classify rois as good or bad
-    'use_cuda':False, # whether or not to use GPUs
-
-    ## the rest of these are necessary parameters to set for that get ignored
-    ## since we are seeding the algorithm for initialization
-    'K': 300,  
-    'gSig':[10,10]
-    """
-    inputs = locals()
-    inputs.pop('output_dir')
-    inputs.pop('z')
-    inputs.pop('func_ch_file')
-    inputs.pop('roi_masks')
-    inputs.pop('max_processes')
+    inputs = {
+        'fr': fr,
+        'decay_time': decay_time,  # 1.8 s for GCaMP6s, ~0.4 s for faster indicators
+        'p': p,                    # AR order: 2 for GCaMP6s, 1 for faster indicators
+        'nb': nb,                  # number of background components
+        'rf': rf,                  # must be None for seeded mode
+        'only_init': only_init,    # must be False for seeded mode
+        'min_SNR': min_SNR,        # quality check: transient SNR threshold
+        'rval_thr': rval_thr,      # quality check: spatial correlation threshold
+        'use_cnn': use_cnn,        # CNN classifier in the quality check
+        'use_cuda': use_cuda,
+        # required by CNMFParams, ignored when CNMF is seeded
+        'K': K,
+        'gSig': gSig,
+    }
 
     from caiman.source_extraction.cnmf import cnmf
     from caiman.source_extraction.cnmf import params
@@ -626,8 +631,8 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
             cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
             cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
 
+            # scores every component; no select_components, so nothing is removed
             cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
-            cnm.estimates.select_components(use_object=True)
             break
         except MemoryError:
             # other programs may have taken memory since the plan was made
@@ -639,6 +644,10 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
             cm.stop_server(dview=dview)
 
     cnm.dview = None  # must be None before save so file is marked correctly
+
+    n_pass = len(cnm.estimates.idx_components)
+    print(f"  CaImAn quality check (fr = {fr:.3f} Hz): {n_pass} / {cnm.estimates.A.shape[1]} "
+          f"components passed; failures are kept and start rejected in the neuron viewer")
 
     cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
     cnm.save(cnmf_file.as_posix())
@@ -765,7 +774,13 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
         _save_provenance(provenance)
         return provenance
 
-    cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
+    # CNMF_PARAMS holds the defaults; runcnmf_params overrides them and must carry fr
+    from params import CNMF_PARAMS
+    cnmf_kwargs = {**CNMF_PARAMS, **runcnmf_params}
+    if 'fr' not in cnmf_kwargs:
+        raise ValueError("source_extraction needs runcnmf_params['fr'] (imaging rate per plane, "
+                         "1 / frame period); CaImAn's 30 Hz default is wrong for this data")
+    cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **cnmf_kwargs)
 
     # Optional post-CNMF interactive neuron curation
     _is_cell_file = None
