@@ -15,6 +15,7 @@ import matplotlib.cm as cm
 import caiman
 from caiman.base.rois import com
 from visualization.roi_legacy import get_contours
+from analysis.responders import stim_medians, classify_from_medians, responder_order
 
 import glob
 from caiman.source_extraction.cnmf import cnmf 
@@ -464,48 +465,16 @@ def get_resp_n(stims_n, z_ids, stim_onset_idx=51, threshold=1.64):
     group_sizes : list of int — rows per display group (sidebar colouring)
     z_ids_resp  : (K_resp,) int array — z-plane label per sorted row
     """
+    # classification lives in analysis.responders so the saved per-neuron
+    # table (analysis.results_io) and combine_mice.py use the same rules
     N = len(stims_n)
-    start = stim_onset_idx
-    T = stims_n[0].shape[1]
-
-    medians = np.array([np.median(s[:, start:], axis=1) for s in stims_n]).T  # (K, N)
-    responds = medians > threshold  # (K, N)
-
-    def _sort_indices(mask, key_col):
-        idx = np.where(mask)[0]
-        if len(idx) == 0:
-            return idx
-        return idx[np.argsort(-medians[idx, key_col])]
-
-    if N == 1:
-        g0 = _sort_indices(responds[:, 0], 0)
-        sorted_idx = g0
-        nums = [int(responds[:, 0].sum())]
-        group_sizes = [len(g0)]
-
-    elif N == 2:
-        r1 = responds[:, 0];  r2 = responds[:, 1]
-        g0 = _sort_indices(r1 & ~r2, 0)
-        g1 = _sort_indices(r1 &  r2, 0)
-        g2 = _sort_indices(~r1 & r2, 1)
-        sorted_idx = np.concatenate([g0, g1, g2])
-        nums = [int((r1 & ~r2).sum()), int((r1 & r2).sum()), int((~r1 & r2).sum())]
-        group_sizes = [len(g0), len(g1), len(g2)]
-
-    else:  # N = 3 or 4: group by primary stimulus
-        any_resp = responds.any(axis=1)
-        resp_idx = np.where(any_resp)[0]
-        if len(resp_idx) == 0:
-            return ([np.empty((0, T)) for _ in stims_n],
-                    [0] * N, [0] * N, np.array([], dtype=int))
-        primary = np.argmax(medians[resp_idx], axis=1)
-        groups = [_sort_indices(
-                      np.isin(np.arange(len(stims_n[0])), resp_idx[primary == j]),
-                      j)
-                  for j in range(N)]
-        sorted_idx = np.concatenate(groups)
+    medians = stim_medians(stims_n, stim_onset_idx)
+    responds, group = classify_from_medians(medians, threshold)
+    sorted_idx, group_sizes = responder_order(medians, group, N)
+    if N == 2:
+        nums = list(group_sizes)
+    else:
         nums = [int(responds[:, j].sum()) for j in range(N)]
-        group_sizes = [len(g) for g in groups]
 
     resp_n = [s[sorted_idx] for s in stims_n]
     return resp_n, nums, group_sizes, z_ids[sorted_idx]
@@ -523,7 +492,10 @@ def get_resp1_resp2(stims1, stims2, z_ids, stim_onset_idx=51, threshold=1.64):
 def get_region_labels(provenance, subregion_dir):
     """
     Return int array (N_neurons,) with neuron-to-region assignments:
-      0 = Region A, 1 = Region B, -1 = unclassified / no sub-region file.
+      0 = AP, 1 = NTS, -1 = unclassified / no sub-region file.
+    The ROI editor saves (AP, not-AP) masks, so every neuron on a plane with an
+    AP outline is classified; -1 only remains for planes without one (or for
+    older files that held two separately drawn regions).
     Neuron ordering matches get_stims1_stims2 output for the same provenance.
     """
     from caiman.source_extraction.cnmf import cnmf as cnmf_module

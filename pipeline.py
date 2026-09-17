@@ -439,7 +439,8 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 #
 def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
                     flow_threshold=2, cellprob_threshold=-1, diameter=15,
-                    model_type='cyto3', gpu=_USE_GPU, show_figs=True):
+                    model_type='cyto3', gpu=_USE_GPU, show_figs=True,
+                    roi_masks_override=None):
 
     """
     "method" :'max', 
@@ -450,10 +451,11 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
     "cellprob_threshold" : -1, 
     "diameter" : 15, 
     "model_type" : 'cyto',
-    'show_figs' : True   # show figures  
-    """    
+    'show_figs' : True   # show figures
+    'roi_masks_override' : None  # (h*w, N) masks to use instead of running Cellpose
+                                 # (a resumed curation); the background is still built
+    """
 
-    from cellpose import models
     import cv2 as cv
 
     func = cm.load(func_ch_file)
@@ -476,12 +478,26 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
         plt.imshow(func_lc)
 
     ###
-    model = models.CellposeModel(model_type=model_type, gpu=gpu)
-    masks, _, _ = model.eval(func_lc, diameter=diameter,
-                             flow_threshold=flow_threshold,
-                             cellprob_threshold=cellprob_threshold)
-    
-    roi_masks = np.array([(masks==i).flatten('F') for i in np.sort(np.unique(masks))[1:]]).T
+    if roi_masks_override is not None and roi_masks_override.shape[0] == func_lc.size:
+        roi_masks = np.asarray(roi_masks_override, dtype=bool)
+    else:
+        if roi_masks_override is not None:
+            print(f'  saved ROIs do not match this field of view '
+                  f'({roi_masks_override.shape[0]} vs {func_lc.size} px), running Cellpose')
+        from cellpose import models
+        model = models.CellposeModel(model_type=model_type, gpu=gpu)
+        masks, _, _ = model.eval(func_lc, diameter=diameter,
+                                 flow_threshold=flow_threshold,
+                                 cellprob_threshold=cellprob_threshold)
+
+        labels = np.sort(np.unique(masks))[1:]
+        if len(labels):
+            roi_masks = np.array([(masks==i).flatten('F') for i in labels]).T
+        else:
+            # no cells found: keep the (pixels, 0) shape, a bare np.array([]) is
+            # 1-D and breaks everything that reads roi_masks.shape[1]
+            print(f'  Cellpose found no ROIs in {z}')
+            roi_masks = np.zeros((func_lc.size, 0), dtype=bool)
 
     #create image with masks for GUI purposes
     roi_img_bkg = (func_lc*190 // func_lc.max()).astype(np.uint8)
@@ -558,10 +574,13 @@ def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_
 
 def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
             rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=_USE_GPU,
-            K=300, gSig=[10,10]):
+            K=300, gSig=[10,10], max_processes=None):
 
 
     """
+    'max_processes': None, # worker cap; None = cores - 1.  The actual count is
+                           # sized to free RAM at run time (worker_budget.py)
+
     'fr': MCVID_PARAMS['fr'],
     'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
     'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
@@ -582,29 +601,43 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
     inputs.pop('z')
     inputs.pop('func_ch_file')
     inputs.pop('roi_masks')
+    inputs.pop('max_processes')
 
     from caiman.source_extraction.cnmf import cnmf
     from caiman.source_extraction.cnmf import params
-
-    opts = params.CNMFParams(params_dict=inputs)
-
-
-    _, dview, n_processes = cm.cluster.setup_cluster(
-        backend='multiprocessing', n_processes=None, single_thread=False)
-
-
-    # do an initial fit of the cnmf
-    cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
+    from worker_budget import plan_cnmf_workers
 
     Yr, dims, T = cm.load_memmap(func_ch_file)
     f_ch_rigcorr = np.reshape(Yr.T, [T] + list(dims), order='F')
 
-    cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
+    # Worker count follows free RAM instead of CaImAn's cores-1 default, and each
+    # worker gets a fixed-size pixel chunk rather than 1/n of the movie, so the
+    # data held at once scales with the workers actually running.
+    n_workers, npx, plan = plan_cnmf_workers(T, max_processes)
+    print(f"  {plan}")
 
-    cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
-    cnm.estimates.select_components(use_object=True)
+    while True:
+        opts = params.CNMFParams(params_dict=inputs)
+        opts.set('preprocess', {'n_pixels_per_process': npx})
+        _, dview, n_processes = cm.cluster.setup_cluster(
+            backend='multiprocessing', n_processes=n_workers, single_thread=False)
+        try:
+            # do an initial fit of the cnmf
+            cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
+            cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
 
-    cm.stop_server(dview=dview)
+            cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
+            cnm.estimates.select_components(use_object=True)
+            break
+        except MemoryError:
+            # other programs may have taken memory since the plan was made
+            if n_workers <= 1:
+                raise
+            n_workers = max(1, n_workers // 2)
+            print(f"  ⚠ CNMF ran out of memory, retrying with {n_workers} worker(s) …")
+        finally:
+            cm.stop_server(dview=dview)
+
     cnm.dview = None  # must be None before save so file is marked correctly
 
     cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
@@ -634,7 +667,11 @@ def _visualize_src_extraction_results(self, idx=[41]):
 
 
 @capture_args
-def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, neuron_viewer_fn=None, **kwargs):
+def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_params={}, roi_editor_fn=None, neuron_viewer_fn=None,
+                      initial_rois_fn=None, **kwargs):
+    """initial_rois_fn(output_dir, z) -> (h*w, N) masks or None.  When it returns
+    masks, Cellpose is skipped and the ROI editor starts from them (resuming a
+    previous curation)."""
 
     import glob 
 
@@ -705,7 +742,11 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     mc_corr_file = rigcorr_results_filenames[ch_dict['mc_ch']] 
     func_corr_file = rigcorr_results_filenames[ch_dict['func_ch']] 
 
-    _idroi = {**idroi_params, 'show_figs': False} if roi_editor_fn is not None else idroi_params
+    _idroi = {**idroi_params, 'show_figs': False} if roi_editor_fn is not None else dict(idroi_params)
+    if initial_rois_fn is not None:
+        _saved = initial_rois_fn(output_dir, z)
+        if _saved is not None:
+            _idroi['roi_masks_override'] = _saved
     roi_masks, _, roi_img_bkg, roi_img_mask, func_lc = _identify_rois(output_dir, func_corr_file, z, **_idroi)
 
     if roi_editor_fn is not None:
@@ -714,6 +755,15 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     else:
         roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask = _addremove_rois_manually(
             output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
+
+    if roi_masks.ndim != 2 or roi_masks.shape[1] == 0:
+        # CNMF cannot be seeded with zero ROIs.  The plane is left out of
+        # source_extraction entirely, so later stages skip it instead of
+        # reading a missing or stale CNMF file.
+        print(f'  {z}: no ROIs after curation, skipping CNMF for this plane')
+        provenance['source_extraction'].pop(z, None)
+        _save_provenance(provenance)
+        return provenance
 
     cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
 

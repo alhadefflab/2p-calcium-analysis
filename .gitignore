@@ -48,6 +48,9 @@ env/
 # Claude Code
 .claude/
 
+# Personal issue / TODO tracker
+KNOWN_ISSUES.md
+
 # macOS metadata
 .DS_Store
 ._*

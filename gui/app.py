@@ -32,7 +32,7 @@ def _detect_zplanes(folder: str) -> list[str]:
     zs = set()
     for f in path.iterdir():
         if f.suffix == ".tif":
-            m = re.findall(r"(\d{6})ome", f.stem)
+            m = re.findall(r"(\d{6})\.ome", f.stem)
             if m:
                 zs.add(f"z{int(m[0])}")
     return sorted(zs)
@@ -323,6 +323,7 @@ class PipelineGUI(ctk.CTk):
 
         ap = prov.get("analysis_params") or {}
         if ap:
+            if "z_planes"      in ap: self.z_planes_var.set(",".join(ap["z_planes"]))
             if "frame_period"  in ap: self.frame_period_var.set(str(ap["frame_period"]))
             if "pre_discard_s" in ap: self.pre_discard_var.set(str(ap["pre_discard_s"]))
             if "baseline_s"    in ap: self.baseline_var.set(str(ap["baseline_s"]))
@@ -419,8 +420,10 @@ class PipelineGUI(ctk.CTk):
 
         self.mc_ch_var   = ctk.StringVar(value="ch1")
         self.func_ch_var = ctk.StringVar(value="ch2")
-        field("Motion-correction channel:", self.mc_ch_var,   "structural / anatomical")
-        field("Functional channel:",        self.func_ch_var, "calcium indicator signal")
+        field("Motion-correction channel:", self.mc_ch_var,
+              "structural / anatomical  —  Prairie View Ch1 = red PMT (tdTomato)")
+        field("Functional channel:",        self.func_ch_var,
+              "calcium indicator signal  —  Prairie View Ch2 = green PMT (GCaMP)")
 
         ctk.CTkLabel(tab, text="─" * 62, text_color="gray").pack(pady=8)
         ctk.CTkLabel(tab, text="Cellpose ROI detection",
@@ -593,9 +596,15 @@ class PipelineGUI(ctk.CTk):
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
+        self.resume_curation = ctk.CTkCheckBox(
+            stages,
+            text="Resume previous ROI curation,  reopen the editor with the neurons you "
+                 "added / removed last time instead of a fresh Cellpose detection")
+        self.resume_curation.pack(anchor="w", padx=40, pady=(0, 4))
+
         self.do_subregion_setup = ctk.CTkCheckBox(
             stages,
-            text="Sub-region setup,  (re)define sub-regions without re-running CNMF")
+            text="Sub-region setup,  (re)draw the AP outline (rest = NTS) without re-running CNMF")
         self.do_subregion_setup.pack(anchor="w", padx=16, pady=4)
 
         self.do_neuron_curation = ctk.CTkCheckBox(
@@ -616,7 +625,7 @@ class PipelineGUI(ctk.CTk):
 
         self.do_subregion = ctk.CTkCheckBox(
             stages,
-            text="Sub-region analysis,  optional, requires regions defined in the ROI editor")
+            text="Sub-region analysis (AP vs NTS),  optional, requires the AP outlined in the ROI editor")
         self.do_subregion.pack(anchor="w", padx=16, pady=4)
 
         self.do_population = ctk.CTkCheckBox(
@@ -749,9 +758,150 @@ class PipelineGUI(ctk.CTk):
         self.run_btn.configure(state="disabled", text="Running…")
         threading.Thread(target=self._run_pipeline, args=(p,), daemon=True).start()
 
-    def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask):
-        """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish."""
+    # ── reference-channel loading for the sub-region view ─────────────────────
+
+    @staticmethod
+    def _channel_list(provenance, z) -> list[str]:
+        """Every channel name present for this z-plane, motion-corrected or not.
+
+        combine_tiffs writes one combined TIFF per channel found in the raw
+        acquisition, so channels outside ch_dict (e.g. a tdTomato channel that
+        is neither the functional nor the motion-correction channel) are still
+        on disk and can be shown as an anatomical reference.
+        """
+        chans: list[str] = []
+        sessions = ((provenance.get('load_data') or {}).get('filenames') or {})
+        for sess in sessions.values():
+            for ch in ((sess or {}).get(z) or {}):
+                if ch not in chans:
+                    chans.append(ch)
+        rig = (((provenance.get('rigid_motion_correction') or {}).get(z) or {})
+               .get('filenames') or {})
+        for ch in rig:
+            if ch not in chans:
+                chans.append(ch)
+        return sorted(chans)
+
+    def _gray_to_bkg(self, img, target_hw, tag=""):
+        """Resize a 2-D projection to target_hw and replicate to three planes.
+
+        Deliberately keeps **float32** precision.  The old version divided by
+        img.max() and cast to uint8 here, before the editor's contrast sliders
+        ever saw the data.  On a dim channel with one bright outlier that
+        collapses the whole low end onto a handful of integer levels — most of
+        the frame lands on exactly 0 — which both destroys faint structure and
+        makes the Dark clip slider a no-op, since every low percentile then
+        returns the same value.  The editor's _stretch() does its own
+        percentile normalisation, so quantising early buys nothing.
+        """
+        import cv2 as cv
+
+        img    = np.asarray(img, dtype=np.float32)
+        th, tw = target_hw
+        if img.shape != (th, tw):
+            self._log(f"  {tag} dims {img.shape} differ from functional "
+                      f"{(th, tw)},  resizing to match.")
+            img = cv.resize(img, (tw, th), interpolation=cv.INTER_LINEAR)
+
+        pct = np.percentile(img, [0, 1, 25, 50, 75, 99, 100])
+        self._log(f"  {tag} intensity 0/1/25/50/75/99/100 pct: "
+                  + "  ".join(f"{v:.1f}" for v in pct))
+        return np.repeat(img[:, :, None], 3, axis=2)
+
+    @staticmethod
+    def _reduce_memmap(Yr, dims, stat, chunk=8192):
+        """Per-pixel temporal statistic over a CaImAn memmap.
+
+        `Yr` is (n_pixels, T), so each pixel's time course is one row and any
+        temporal statistic is a row-wise reduction.  Chunking over pixels keeps
+        peak memory at chunk x T floats instead of the whole movie.
+        """
+        n   = Yr.shape[0]
+        out = np.empty(n, dtype=np.float32)
+        for i in range(0, n, chunk):
+            blk = np.asarray(Yr[i:i + chunk], dtype=np.float32)
+            out[i:i + chunk] = (blk.mean(axis=1) if stat == "mean"
+                                else np.percentile(blk, 99, axis=1))
+        return out.reshape(dims, order='F')
+
+    @staticmethod
+    def _reduce_stack(stack, stat):
+        """Same statistic over an in-memory (T, h, w) stack."""
+        if stack.ndim == 2:
+            return stack
+        return (stack.mean(axis=0) if stat == "mean"
+                else np.percentile(stack, 99, axis=0))
+
+    def _channel_background(self, provenance, z, ch, target_hw, stat="mean"):
+        """Temporal projection of `ch` as ((h, w, 3) uint8, note).
+
+        `stat` is "mean" (best SNR on a static label such as tdTomato — averaging
+        T frames cuts shot noise by sqrt(T)) or "p99" (the same 99th-percentile
+        statistic the functional summary image uses, which sees past motion-
+        correction border fill and vessel shadows).  Display only: nothing here
+        feeds the analysis, the seeding image is built separately in
+        pipeline._identify_rois.
+
+        Prefers the motion-corrected memmap.  Channels that were never motion
+        corrected fall back to their raw combined TIFF.  Returns (None, "") when
+        the channel cannot be loaded.
+        """
+        import caiman as cm
+        from tifffile import imread as _imread
+
+        root = Path(provenance.get('output_dir') or '.')
+
+        rig = (((provenance.get('rigid_motion_correction') or {}).get(z) or {})
+               .get('filenames') or {})
+        path = rig.get(ch)
+        if path:
+            path = Path(path)
+            if not path.is_absolute():
+                path = root / z / path.name
+            if path.exists():
+                try:
+                    Yr, dims, _T = cm.load_memmap(str(path))
+                    img = self._reduce_memmap(Yr, dims, stat)
+                except Exception:
+                    # not a CaImAn memmap — fall back to loading the movie whole
+                    img = self._reduce_stack(
+                        np.asarray(cm.load(str(path)), dtype=np.float32), stat)
+                return (self._gray_to_bkg(img, target_hw, tag=f"{ch} {stat}"),
+                        "motion-corrected")
+
+        sessions = ((provenance.get('load_data') or {}).get('filenames') or {})
+        for sess in sessions.values():
+            raw = ((sess or {}).get(z) or {}).get(ch)
+            if not raw:
+                continue
+            raw = Path(raw)
+            if not raw.is_absolute():
+                raw = root / raw.name
+            if not raw.exists():
+                continue
+            stack = np.asarray(_imread(str(raw))).squeeze().astype(np.float32)
+            return (self._gray_to_bkg(self._reduce_stack(stack, stat),
+                                      target_hw, tag=f"{ch} {stat}"),
+                    "raw, not motion-corrected")
+
+        return None, ""
+
+    def _roi_editor_for_pipeline(self, output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask,
+                                 subregion_only=False):
+        """Called from the worker thread. Shows ROIEditorWindow on the main thread and blocks until Finish.
+
+        subregion_only, the ROIs are an already-curated set being reopened to
+        define sub-regions, so the saved curation record is extended rather than
+        replaced (its detected / added / removed history is kept).
+        """
         import yaml
+        from analysis.roi_curation import load_curation, save_curation
+
+        # a plane with no detected ROIs can arrive as a 1-D empty array (older
+        # saved concat_roi-masks.npy files); give it the (pixels, 0) shape
+        roi_masks = np.asarray(roi_masks)
+        if roi_masks.ndim != 2:
+            roi_masks = np.zeros((roi_img_bkg.shape[0] * roi_img_bkg.shape[1], 0), dtype=bool)
         if not Path(mc_corr_file).is_absolute():
             mc_corr_file = str(Path(output_dir) / Path(mc_corr_file).name)
 
@@ -763,47 +913,102 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._display_settings = {}
 
-        mc_img_bkg = None
+        # ── sub-region reference channel ──────────────────────────────────────
+        # Defaults to the motion-correction channel, but every channel found in
+        # the acquisition is offered so the user can pick whichever one carries
+        # the anatomical label (tdTomato) for AP / NTS orientation.
+        target_hw  = roi_img_bkg.shape[:2]
+        provenance = getattr(self, '_provenance', None)
+        channels, ch_default, ch_luts = [], None, {}
+        if provenance is not None:
+            try:
+                ch_dict = ((provenance.get('load_data') or {}).get('args') or {}).get('ch_dict', {})
+                ch_default = ch_dict.get('mc_ch')
+                channels   = self._channel_list(provenance, z)
+                # Prairie View puts the structural label on the red PMT and the
+                # calcium indicator on the green one; mirror that in the viewer.
+                if ch_dict.get('mc_ch'):
+                    ch_luts[ch_dict['mc_ch']] = "Red"
+                if ch_dict.get('func_ch'):
+                    ch_luts[ch_dict['func_ch']] = "Green"
+                self._log(f"  Sub-region reference channels available: {', '.join(channels) or 'none'}")
+            except Exception as _e:
+                self._log(f"  Warning: could not enumerate channels ({_e})")
+
+        def _load_channel(ch, stat="mean"):
+            try:
+                return self._channel_background(provenance, z, ch, target_hw, stat)
+            except Exception as _e:
+                self._log(f"  Warning: could not load channel {ch} ({stat}) "
+                          f"for sub-region view ({_e})")
+                return None, ""
+
+        mc_img_bkg, mc_note = None, ""
+        if provenance is not None and ch_default:
+            mc_img_bkg, mc_note = _load_channel(ch_default, "mean")
+        if mc_img_bkg is None:
+            # Fall back to the motion-corrected file the pipeline handed us.  The
+            # channel picker is dropped here: if provenance could not serve the
+            # default channel it cannot be trusted to serve the others either.
+            channels = []
+            try:
+                import caiman as cm
+                mc_img_bkg = self._gray_to_bkg(
+                    np.mean(cm.load(mc_corr_file), axis=0), target_hw, tag="MC channel")
+                mc_note = "motion-corrected"
+                ch_default = ch_default or "MC"
+            except Exception as _e:
+                self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
+
+        # ── previous curation of this plane ───────────────────────────────────
+        # The AP outline is restored either way (the anatomy has not moved).
+        # Stable ids are only reused when these ROIs are that curation's output.
+        prev = (None, None)
         try:
-            import caiman as cm
-            import cv2 as cv
-            from PIL import Image as _PILImg
-            mc_movie = cm.load(mc_corr_file)
-            mc_mean  = np.mean(mc_movie, axis=0)
-            scale    = mc_mean.max()
-            if scale > 0:
-                mc_gray = (mc_mean * 190 / scale).astype(np.uint8)
-                func_h, func_w = roi_img_bkg.shape[:2]
-                mc_h, mc_w = mc_gray.shape
-                if (mc_h, mc_w) != (func_h, func_w):
-                    self._log(
-                        f"  MC channel dims {(mc_h, mc_w)} differ from functional "
-                        f"{(func_h, func_w)},  resizing MC background to match.")
-                    mc_gray = np.array(
-                        _PILImg.fromarray(mc_gray).resize(
-                            (func_w, func_h), _PILImg.BILINEAR))
-                else:
-                    self._log(
-                        f"  MC background dims match functional ({func_h}×{func_w}), no resize needed.")
-                mc_img_bkg = cv.cvtColor(mc_gray, cv.COLOR_GRAY2RGB)
+            prev = load_curation(output_dir, z)
         except Exception as _e:
-            self._log(f"  Warning: could not load MC channel for sub-region view ({_e})")
+            self._log(f"  Warning: could not read previous ROI curation for {z} ({_e})")
+        # a resumed plane uses the record its masks were rebuilt from, whose id
+        # list matches those masks column for column
+        prev_rec = getattr(self, '_resumed_planes', {}).get(z) or prev[0] or {}
+        resumed = z in getattr(self, '_resumed_planes', {})
+        reuse_ids = ((subregion_only or resumed)
+                     and len(prev_rec.get("final_ids") or []) == roi_masks.shape[1])
+        ap_polygon = prev_rec.get("ap_polygon")
+        if ap_polygon:
+            self._log(f"  {z}: AP outline restored from the previous curation.")
 
         result_holder = [None]
         done = threading.Event()
 
         def _show():
-            def _on_finish(masks, bkg, mask_img, settings, sreg_masks=None):
-                result_holder[0] = (masks, bkg, mask_img, settings, sreg_masks)
+            def _on_finish(masks, bkg, mask_img, settings, sreg_masks=None, record=None):
+                result_holder[0] = (masks, bkg, mask_img, settings, sreg_masks, record)
                 done.set()
-            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
-                            _on_finish, display_settings=self._display_settings,
-                            mc_img_bkg=mc_img_bkg)
+            try:
+                ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
+                                _on_finish, display_settings=self._display_settings,
+                                mc_img_bkg=mc_img_bkg,
+                                channels=channels, channel_loader=_load_channel,
+                                channel_default=ch_default, channel_note=mc_note,
+                                channel_luts=ch_luts,
+                                roi_ids=prev_rec.get("final_ids") if reuse_ids else None,
+                                n_detected=prev_rec.get("n_detected") if reuse_ids else None,
+                                next_id=prev_rec.get("next_id") if reuse_ids else None,
+                                ap_polygon=ap_polygon)
+            except Exception as e:
+                # without this the worker thread waits forever on a window that
+                # never opened and the pipeline hangs silently
+                result_holder[0] = e
+                self._log(traceback.format_exc())
+                done.set()
 
         self.after(0, _show)
         done.wait()
 
-        new_masks, new_bkg, new_mask_img, settings, sreg_masks = result_holder[0]
+        if isinstance(result_holder[0], Exception):
+            raise RuntimeError(f"ROI editor for {z} failed to open") from result_holder[0]
+        new_masks, new_bkg, new_mask_img, settings, sreg_masks, record = result_holder[0]
 
         self._display_settings = settings
         with open(ds_path, 'w') as f:
@@ -812,13 +1017,103 @@ class PipelineGUI(ctk.CTk):
         roi_masks_file = Path(output_dir) / 'concat_roi-masks.npy'
         np.save(roi_masks_file, new_masks)
 
+        # (AP, NTS) masks, region 0 is AP, region 1 is everything outside it
+        sreg_file = Path(output_dir) / f'subregion_masks_{z}.npy'
         if sreg_masks and any(m is not None for m in sreg_masks):
             h, w = roi_img_bkg.shape[:2]
             fill = np.zeros((h, w), dtype=bool)
             sreg_arr = np.stack([m if m is not None else fill for m in sreg_masks])
-            np.save(Path(output_dir) / f'subregion_masks_{z}.npy', sreg_arr)
+            np.save(sreg_file, sreg_arr)
+        elif sreg_file.exists():
+            # finished without an AP on purpose, a stale file would silently
+            # keep classifying this plane with the old outline.  Set aside, not
+            # deleted, so older hand-drawn regions are never lost.
+            bak = sreg_file.with_name(f'subregion_masks_{z}.cleared.npy')
+            sreg_file.replace(bak)
+            self._log(f"  {z}: no AP defined, previous sub-regions moved to {bak.name}")
+
+        if record is not None:
+            try:
+                s = save_curation(output_dir, z, record,
+                                  previous=prev if reuse_ids else None)
+                ac = s["after_curation"]
+                self._log(
+                    f"  {z} curation: detected {s['n_detected']}  →  final {s['n_final']}  "
+                    f"(added {len(s['added_ids'])}, removed by hand "
+                    f"{len(s['removed_manual_ids'])}, excluded by region "
+                    f"{len(s['removed_region_ids'])})")
+                if s["ap_polygon"]:
+                    d = ac["all"]["density"]
+                    self._log(
+                        f"    AP: {ac['all']['count']['AP']} neurons ({d['AP']} / 10k px²)   "
+                        f"NTS: {ac['all']['count']['NTS']} neurons ({d['NTS']} / 10k px²)")
+                self._log(f"    Record + screenshots: {Path(output_dir) / 'roi_curation'}")
+                self._write_curation_summary(Path(output_dir).parent)
+            except Exception:
+                self._log(f"  ⚠ Could not save ROI curation record for {z}:")
+                self._log(traceback.format_exc())
 
         return new_masks, roi_masks_file, new_bkg, new_mask_img
+
+    def _load_previous_curation(self, plane_dir, z):
+        """initial_rois_fn for source_extraction: the ROIs saved by this plane's
+        last curation, or None (→ Cellpose runs as usual)."""
+        from analysis.roi_curation import load_curated_masks
+        try:
+            got = load_curated_masks(plane_dir, z)
+        except Exception as _e:
+            self._log(f"  Warning: could not load previous curation for {z} ({_e}), "
+                      "running Cellpose.")
+            return None
+        if got is None:
+            self._log(f"  {z}: no previous curation saved, running Cellpose.")
+            return None
+        masks, rec = got
+        self._resumed_planes[z] = rec
+        self._log(
+            f"  {z}: resuming previous curation, {masks.shape[1]} ROIs "
+            f"({len(rec.get('added_ids', []))} added, "
+            f"{len(rec.get('removed_manual_ids', [])) + len(rec.get('removed_region_ids', []))} "
+            f"removed last time). Cellpose skipped.")
+        return masks
+
+    # ── curation yield ────────────────────────────────────────────────────────
+
+    def _write_curation_summary(self, animal_dir):
+        from analysis.roi_curation import write_summary
+        try:
+            path = write_summary(animal_dir)
+            if path is not None:
+                self._log(f"    Curation summary: {path}")
+        except Exception as _e:
+            self._log(f"  Warning: could not write curation summary ({_e})")
+
+    def _report_curation_yield(self, provenance, z, responsive=None, cnm=None):
+        """Track detected vs hand-added neurons through CNMF / acceptance /
+        responsiveness, for one plane.  Silent when the plane has no curation
+        record (curated before records existed)."""
+        from analysis.roi_curation import update_yield, format_yield
+        from pipeline_funcs import _load_is_cell
+        try:
+            se = (provenance.get('source_extraction') or {}).get(z) or {}
+            cnm_file = (se.get('filenames') or {}).get('cnm_file')
+            if not cnm_file or not Path(cnm_file).exists():
+                return
+            plane_dir = Path(cnm_file).parent
+            if not (plane_dir / 'roi_curation' / f'roi_curation_{z}.json').exists():
+                return
+            if cnm is None:
+                from caiman.source_extraction.cnmf import cnmf as _cnmf_module
+                cnm = _cnmf_module.load_CNMF(str(cnm_file))
+            y = update_yield(plane_dir, z, cnm.estimates.A,
+                             is_cell=_load_is_cell(cnm_file, z),
+                             responsive=responsive)
+            if y is not None:
+                for line in format_yield(z, y):
+                    self._log(line)
+                self._write_curation_summary(plane_dir.parent)
+        except Exception as _e:
+            self._log(f"  Warning: curation yield for {z} unavailable ({_e})")
 
     def _neuron_viewer_for_pipeline(self, cnm, mean_img, provenance=None, z=None):
         """Called from the worker thread. Opens NeuronViewerWindow on the main thread
@@ -972,7 +1267,19 @@ class PipelineGUI(ctk.CTk):
             f"({n_stims} session(s) × {d['ses_f']} = {n_stims * d['ses_f']} total)"
         )
 
+        def _record_analysis_params(provenance, n_stims_val):
+            provenance['analysis_params'] = dict(
+                frame_period=fp, pre_discard_s=pre_s,
+                baseline_s=base_s, stim_s=stim_s, threshold=threshold,
+                n_stims=n_stims_val, z_planes=p["z_planes"],
+                cp_diameter=p["cellpose"]["diameter"],
+                cp_flow_threshold=p["cellpose"]["flow_threshold"],
+                cp_cellprob=p["cellpose"]["cellprob_threshold"],
+            )
+            _save_provenance(provenance)
+
         _all_stims_n: list[list[np.ndarray]] = []   # [animal][stim_idx] → (K, T)
+        _animal_labels: list[str] = []              # aligned with _all_stims_n
         _z_ids:  list[np.ndarray] = []
         _all_region_labels: list[np.ndarray] = []
         _all_spatial = []
@@ -984,6 +1291,14 @@ class PipelineGUI(ctk.CTk):
             self._log(f"\n── Animal {i + 1}  ({label})")
 
             provenance = init(out_dir)
+            # made available to _roi_editor_for_pipeline, which is called from
+            # inside source_extraction and has no provenance of its own
+            self._provenance = provenance
+
+            # Persist the run configuration immediately, before any processing,
+            # so reopening this project later recovers the settings actually used
+            # even if the run is interrupted or only an earlier stage is selected.
+            _record_analysis_params(provenance, n_stims)
 
             if self.do_mc.get():
                 for z in p["z_planes"]:
@@ -999,9 +1314,14 @@ class PipelineGUI(ctk.CTk):
             else:
                 self._log("  Skipping motion correction,  loading saved provenance.")
                 provenance = _get_provenance(out_dir)
+                self._provenance = provenance
 
+            self._provenance = provenance
+
+            self._resumed_planes = {}              # z -> record the ROIs came from
             if self.do_cnmf.get():
                 roi_fn = self._roi_editor_for_pipeline
+                resume_fn = self._load_previous_curation if self.resume_curation.get() else None
                 cp = p["cellpose"]
                 self._log(
                     f"  Cellpose params,  diameter: {cp['diameter']}  "
@@ -1020,12 +1340,15 @@ class PipelineGUI(ctk.CTk):
                         provenance, None, z, None,
                         roi_editor_fn=roi_fn,
                         neuron_viewer_fn=_make_viewer_fn(z),
+                        initial_rois_fn=resume_fn,
                         idroi_params=cp)
+                    self._report_curation_yield(provenance, z)
             else:
                 self._log("  Skipping CNMF,  using saved results.")
 
             if self.do_subregion_setup.get():
                 self._log("  Sub-region setup, ROI editor will open for sub-region definition …")
+                self._provenance = provenance
                 try:
                     import caiman as cm
                     import cv2 as _cv2
@@ -1070,7 +1393,9 @@ class PipelineGUI(ctk.CTk):
 
                         self._roi_editor_for_pipeline(
                             Path(out_dir) / z, mc_corr_file, z,
-                            roi_masks, roi_img_bkg, roi_img_mask)
+                            roi_masks, roi_img_bkg, roi_img_mask,
+                            subregion_only=True)
+                        self._report_curation_yield(provenance, z)
                 except Exception:
                     self._log("  ⚠ Sub-region setup failed:")
                     self._log(traceback.format_exc())
@@ -1107,6 +1432,7 @@ class PipelineGUI(ctk.CTk):
                             np.save(is_cell_file, is_cell)
                             provenance['source_extraction'][z]['filenames']['is_cell_file'] = str(is_cell_file)
                             _save_provenance(provenance)
+                            self._report_curation_yield(provenance, z, cnm=cnm)
                 except Exception:
                     self._log("  ⚠ Neuron curation failed:")
                     self._log(traceback.format_exc())
@@ -1130,6 +1456,8 @@ class PipelineGUI(ctk.CTk):
                             n_acc = int(new_is_cell.sum())
                             self._log(f"  {z}: {n_acc} / {len(new_is_cell)} neurons accepted")
                         _save_provenance(provenance)
+                        for z in updated:
+                            self._report_curation_yield(provenance, z)
                     except Exception:
                         self._log("  ⚠ Multi-plane review failed:")
                         self._log(traceback.format_exc())
@@ -1154,48 +1482,52 @@ class PipelineGUI(ctk.CTk):
                     baseline_s=base_s,
                     stim_s=stim_s,
                 )
-                provenance['analysis_params'] = dict(
-                    frame_period=fp, pre_discard_s=pre_s,
-                    baseline_s=base_s, stim_s=stim_s, threshold=threshold,
-                    n_stims=len(stims_n),
-                    cp_diameter=p["cellpose"]["diameter"],
-                    cp_flow_threshold=p["cellpose"]["flow_threshold"],
-                    cp_cellprob=p["cellpose"]["cellprob_threshold"],
-                )
-                _save_provenance(provenance)
+                _record_analysis_params(provenance, len(stims_n))
 
                 # Accumulate per-animal stims,  each is a list of N arrays
                 _all_stims_n.append(stims_n)
+                _animal_labels.append(label)
                 _z_ids.append(z_ids)
+
+                # detected vs hand-added: how many respond?  Same criterion as
+                # get_resp_n, median z-score over the stim window above threshold
+                # for any stimulus.  Rows follow get_stims_n's plane order.
+                _responds = np.any(
+                    [np.median(s[:, stim_onset_idx:], axis=1) > threshold
+                     for s in stims_n], axis=0)
+                for z in provenance['source_extraction'].keys():
+                    _rows = z_ids == int(str(z).replace('z', ''))
+                    self._report_curation_yield(provenance, z,
+                                                responsive=_responds[_rows])
                 self._log("  Building spatial response data …")
                 _all_spatial.append((label, get_spatial_response_data(
                     provenance, fp, pre_s, base_s, stim_s,
                     subregion_dir=out_dir)))
 
-                if self.do_subregion.get():
+                # AP / NTS label per neuron whenever an AP outline exists, so it is
+                # saved in neurons.csv even when the sub-region plots are not requested
+                sreg_files = {z: Path(out_dir) / z / f'subregion_masks_{z}.npy'
+                              for z in p["z_planes"]}
+                rlabels = np.full(stims_n[0].shape[0], -1, dtype=int)
+                if any(f.exists() for f in sreg_files.values()):
                     self._log("  Classifying neurons by sub-region …")
-                    found_any = any(
-                        (Path(out_dir) / z / f'subregion_masks_{z}.npy').exists()
-                        for z in p["z_planes"]
-                    )
-                    if not found_any:
+                    missing = [z for z, f in sreg_files.items() if not f.exists()]
+                    if missing:
                         self._log(
-                            "  ⚠ No subregion_masks_*.npy files found,  expected at:\n"
-                            + "\n".join(
-                                f"      {Path(out_dir) / z / f'subregion_masks_{z}.npy'}"
-                                for z in p["z_planes"])
-                            + "\n    Run 'Sub-region setup' (or CNMF) and define both regions\n"
-                              "    in the ROI editor, then re-run analysis."
-                        )
-                        _all_region_labels.append(np.full(stims_n[0].shape[0], -1, dtype=int))
-                    else:
+                            f"  ⚠ No AP outline for {', '.join(missing)}, their neurons stay\n"
+                            "    unclassified. Run 'Sub-region setup' to add them; planes\n"
+                            "    already outlined reopen with their AP restored.")
+                    try:
                         rlabels = get_region_labels(provenance, out_dir)
-                        _all_region_labels.append(rlabels)
+                    except Exception:
+                        self._log("  ⚠ Sub-region classification failed:")
+                        self._log(traceback.format_exc())
+                    else:
                         n_a = int((rlabels == 0).sum())
                         n_b = int((rlabels == 1).sum())
                         n_none = int((rlabels == -1).sum())
                         self._log(
-                            f"    Region A: {n_a}   Region B: {n_b}   "
+                            f"    AP: {n_a}   NTS: {n_b}   "
                             f"Unclassified: {n_none}"
                         )
                         if n_a == 0 and n_b == 0:
@@ -1203,8 +1535,14 @@ class PipelineGUI(ctk.CTk):
                                 "  ⚠ All neurons are unclassified,  check that the\n"
                                 "    sub-region polygons cover the neurons on the canvas."
                             )
-                else:
-                    _all_region_labels.append(np.full(stims_n[0].shape[0], -1, dtype=int))
+                elif self.do_subregion.get():
+                    self._log(
+                        "  ⚠ No subregion_masks_*.npy files found,  expected at:\n"
+                        + "\n".join(f"      {f}" for f in sreg_files.values())
+                        + "\n    Run 'Sub-region setup' (or CNMF) and outline the AP\n"
+                          "    in the ROI editor, then re-run analysis."
+                    )
+                _all_region_labels.append(rlabels)
 
         if not ((self.do_analysis.get() or self.do_population.get() or
                  self.do_manifold.get()) and _all_stims_n):
@@ -1220,6 +1558,10 @@ class PipelineGUI(ctk.CTk):
             for j in range(N)
         ]
         z_ids_all = np.concatenate(_z_ids)
+        region_labels_all = (np.concatenate(_all_region_labels) if _all_region_labels
+                             else np.full(len(z_ids_all), -1, dtype=int))
+        mouse_labels_all = np.repeat(_animal_labels,
+                                     [s[0].shape[0] for s in _all_stims_n])
 
         # Extract centroids aligned with combined_stims_n (for manifold viewer)
         manifold_centroids = None
@@ -1263,7 +1605,9 @@ class PipelineGUI(ctk.CTk):
 
             results_dir = self._save_results(
                 results_parent, resp_n, nums, z_ids_resp, group_sizes, p,
-                stim_onset_idx, d["ses_f"])
+                stim_onset_idx, d["ses_f"],
+                stims_n=combined_stims_n, z_ids=z_ids_all,
+                region_labels=region_labels_all, mouse_labels=mouse_labels_all)
             self._log(f"Results saved to  {results_dir}")
 
             self._log("Opening figures …")
@@ -1279,9 +1623,8 @@ class PipelineGUI(ctk.CTk):
 
             # optional sub-region analysis
             if self.do_subregion.get() and _all_region_labels:
-                region_labels_all = np.concatenate(_all_region_labels)
                 region_results = {}
-                for reg_idx, reg_name in [(0, "Region A"), (1, "Region B")]:
+                for reg_idx, reg_name in [(0, "AP"), (1, "NTS")]:
                     mask = region_labels_all == reg_idx
                     n_total_r = int(mask.sum())
                     if n_total_r == 0:
@@ -1366,8 +1709,16 @@ class PipelineGUI(ctk.CTk):
     # ── save results ───────────────────────────────────────────────────────
 
     def _save_results(self, out_dir: str, resp_n, nums, z_ids_resp, group_sizes,
-                      params: dict, stim_onset_idx: int, ses_f: int) -> str:
+                      params: dict, stim_onset_idx: int, ses_f: int, *,
+                      stims_n, z_ids, region_labels, mouse_labels) -> str:
+        """Save responder arrays plus the all-neuron table and traces.
+
+        stims_n / z_ids / region_labels / mouse_labels cover every neuron, in
+        the same row order; they become neurons.csv and traces_stim<j>.npy
+        (see analysis.results_io), which combine_mice.py reads.
+        """
         import yaml
+        from analysis.results_io import save_neuron_results, REGIONS
 
         results_dir = Path(out_dir) / "analysis"
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -1379,6 +1730,9 @@ class PipelineGUI(ctk.CTk):
         np.save(results_dir / "group_sizes.npy", np.array(group_sizes))
         np.save(results_dir / "z_ids_resp.npy",  z_ids_resp)
 
+        table = save_neuron_results(results_dir, stims_n, z_ids, region_labels,
+                                    mouse_labels, stim_onset_idx, params["threshold"])
+
         saved_params = dict(
             frame_period   = params["frame_period"],
             pre_discard_s  = params["pre_discard_s"],
@@ -1389,16 +1743,22 @@ class PipelineGUI(ctk.CTk):
             stim_onset_idx = stim_onset_idx,
             ses_f          = ses_f,
             z_planes       = params["z_planes"],
+            mice           = list(dict.fromkeys(table["mouse"])),
+            # all accepted neurons; n_responders is the unique responder count
+            n_total_neurons = len(table),
+            n_responders    = int(table["responder"].sum()),
         )
         if N == 2:
             saved_params.update(
                 n_stim1_only    = int(nums[0]),
                 n_both          = int(nums[1]),
                 n_stim2_only    = int(nums[2]),
-                n_total_neurons = int(sum(nums)),
             )
-        else:
-            saved_params["n_total_neurons"] = int(resp_n[0].shape[0])
+        for reg in REGIONS:
+            in_reg = table["region"] == reg
+            if in_reg.any():
+                saved_params[f"n_neurons_{reg}"]    = int(in_reg.sum())
+                saved_params[f"n_responders_{reg}"] = int(table.loc[in_reg, "responder"].sum())
         with open(results_dir / "params.yaml", "w") as f:
             yaml.safe_dump(saved_params, f, default_flow_style=False)
 

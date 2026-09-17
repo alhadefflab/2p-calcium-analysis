@@ -32,6 +32,9 @@ gui/zplane_viewer.py           # Multi-plane duplicate review (3-D map, IoU dete
 pipeline.py                    # Core pipeline steps (load, motion correct, source extract)
 pipeline_funcs.py              # Post-extraction analysis (z-scoring, responder classification)
 pipeline_utils.py              # Utilities (TIFF combining, YAML provenance, argument capture)
+combine_mice.py                # Pools analysed mice: pooled heatmaps, per-mouse summary, mean ± SEM
+analysis/responders.py         # Responder classification rules (shared by GUI and combine_mice.py)
+analysis/results_io.py         # Writes / reads each mouse's neurons.csv and all-neuron traces
 params.py                      # Default parameters for MC, CNMF, Cellpose; USE_GPU auto-detected
 visualization/response_plots.py  # Response heatmaps, bar charts, region plots
 visualization/roi_legacy.py    # Legacy Bokeh ROI visualization helpers
@@ -141,6 +144,40 @@ The **Number of stimuli** selector in the Animals & Data tab controls how many s
 | 1 | Single-stimulus experiment: neurons are classified as responders or non-responders; one heatmap panel |
 | 2 | Two-stimulus comparison (default): neurons split into stim-1-only / both / stim-2-only groups; two heatmap panels |
 | 3–4 | Multi-stimulus: neurons grouped by their primary responding stimulus; N heatmap panels |
+
+### Analysis outputs
+
+The Analysis stage writes to `<output>/<subject>/analysis/`:
+
+| File | Contents |
+|------|----------|
+| `neurons.csv` | One row per accepted neuron (responders **and** non-responders): mouse, z-plane, index within the plane, region (AP / NTS / unclassified), median z-score per stimulus, responds per stimulus (1/0), responder (1/0), response group.
+| `traces_stim<j>.npy` | z-score trace of every neuron for stimulus *j*, same row order as `neurons.csv` |
+| `resp<j>.npy`, `z_ids_resp.npy`, `nums.npy`, `group_sizes.npy` | Responders only, sorted as in the heatmap |
+| `params.yaml` | Timing and threshold, `n_total_neurons` (all accepted neurons), `n_responders`, group counts, and AP / NTS neuron and responder counts when outlined |
+
+The region column is filled whenever an AP outline exists for the plane, whether or not the sub-region plots are switched on.
+
+### Combining mice
+
+After each mouse has been analysed, pool them with `combine_mice.py` (Anaconda Prompt, from the project folder):
+
+```
+python combine_mice.py D:/out/ZH537 D:/out/ZH539 D:/out/ZH541 --out D:/out/combined --split-region --stim-names Saline CCK
+```
+
+| Output | Contents |
+|--------|----------|
+| `pooled_neurons.csv` | Every neuron from every mouse |
+| `mouse_summary.csv` | One row per mouse: neurons, responders, count and % per group and per stimulus, repeated for AP and NTS |
+| `mean_traces_<All/AP/NTS>.csv` | Per-mouse mean trace of each stimulus's responders, plus mean and SEM across mice |
+| `pooled_heatmap.png` (+ `_AP`, `_NTS`) | Pooled responder heatmap with a mouse colour bar and a group colour bar |
+| `mean_sem_traces.png` | Mean ± SEM across mice (n = mice), individual mice as thin lines |
+| `responders_by_mouse.png` | % of neurons per group, mean ± SEM with one dot per mouse |
+
+Options: `--sort mouse` groups heatmap rows by mouse first; `--include-nonresponders` adds non-responders to the heatmaps; `--threshold 2.0` re-classifies every mouse at one threshold. Mice must share the frame period; if baseline or stimulus lengths differ, traces are cropped to the common window around stimulus onset.
+
+Mice analysed before `neurons.csv` existed need the Analysis stage re-run once, with motion correction and CNMF unchecked. This reads the saved CNMF results, not the movies.
 
 ### Tunable analysis parameters
 
