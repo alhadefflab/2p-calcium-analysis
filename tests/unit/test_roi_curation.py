@@ -101,8 +101,7 @@ def _record(tmp_path):
         removal_reason={1: "manual", 2: "region"},
         exclusion_polygons=[[(0, 0), (65, 0), (65, 59), (0, 59)]],
         keep_mask=keep, ap_polygon=[(0, 0), (20, 0), (20, 20), (0, 20)], ap_mask=ap,
-        func_view=np.zeros((H, W, 3), np.uint8), red_view=np.zeros((H, W, 3), np.uint8),
-        red_label="tdTomato",
+        views=[(k, k, np.zeros((H, W, 3), np.uint8)) for k in ("red", "green", "merge")],
     )
     return rec, det, added
 
@@ -122,7 +121,8 @@ class TestSaveAndYield:
         assert s["detected_before_curation"]["count"]["total"] == 2
         assert s["area_px"]["AP"] == int(rec["ap_mask"].sum())
         d = tmp_path / "z1" / "roi_curation"
-        assert (d / "roi_curation_z1.png").exists()
+        for key in ("red", "green", "merge"):
+            assert (d / f"roi_curation_z1_{key}.png").exists()
         assert "screenshot_error" not in s
         assert json.loads((d / "roi_curation_z1.json").read_text())["n_final"] == 2
 

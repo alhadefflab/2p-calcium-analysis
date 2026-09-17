@@ -490,7 +490,14 @@ def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
                                  flow_threshold=flow_threshold,
                                  cellprob_threshold=cellprob_threshold)
 
-        roi_masks = np.array([(masks==i).flatten('F') for i in np.sort(np.unique(masks))[1:]]).T
+        labels = np.sort(np.unique(masks))[1:]
+        if len(labels):
+            roi_masks = np.array([(masks==i).flatten('F') for i in labels]).T
+        else:
+            # no cells found: keep the (pixels, 0) shape, a bare np.array([]) is
+            # 1-D and breaks everything that reads roi_masks.shape[1]
+            print(f'  Cellpose found no ROIs in {z}')
+            roi_masks = np.zeros((func_lc.size, 0), dtype=bool)
 
     #create image with masks for GUI purposes
     roi_img_bkg = (func_lc*190 // func_lc.max()).astype(np.uint8)
@@ -748,6 +755,15 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
     else:
         roi_masks, roi_masks_file, roi_img_bkg, roi_img_mask = _addremove_rois_manually(
             output_dir, mc_corr_file, z, roi_masks, roi_img_bkg, roi_img_mask)
+
+    if roi_masks.ndim != 2 or roi_masks.shape[1] == 0:
+        # CNMF cannot be seeded with zero ROIs.  The plane is left out of
+        # source_extraction entirely, so later stages skip it instead of
+        # reading a missing or stale CNMF file.
+        print(f'  {z}: no ROIs after curation, skipping CNMF for this plane')
+        provenance['source_extraction'].pop(z, None)
+        _save_provenance(provenance)
+        return provenance
 
     cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
 

@@ -896,6 +896,12 @@ class PipelineGUI(ctk.CTk):
         """
         import yaml
         from analysis.roi_curation import load_curation, save_curation
+
+        # a plane with no detected ROIs can arrive as a 1-D empty array (older
+        # saved concat_roi-masks.npy files); give it the (pixels, 0) shape
+        roi_masks = np.asarray(roi_masks)
+        if roi_masks.ndim != 2:
+            roi_masks = np.zeros((roi_img_bkg.shape[0] * roi_img_bkg.shape[1], 0), dtype=bool)
         if not Path(mc_corr_file).is_absolute():
             mc_corr_file = str(Path(output_dir) / Path(mc_corr_file).name)
 
@@ -979,20 +985,29 @@ class PipelineGUI(ctk.CTk):
             def _on_finish(masks, bkg, mask_img, settings, sreg_masks=None, record=None):
                 result_holder[0] = (masks, bkg, mask_img, settings, sreg_masks, record)
                 done.set()
-            ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
-                            _on_finish, display_settings=self._display_settings,
-                            mc_img_bkg=mc_img_bkg,
-                            channels=channels, channel_loader=_load_channel,
-                            channel_default=ch_default, channel_note=mc_note,
-                            channel_luts=ch_luts,
-                            roi_ids=prev_rec.get("final_ids") if reuse_ids else None,
-                            n_detected=prev_rec.get("n_detected") if reuse_ids else None,
-                            next_id=prev_rec.get("next_id") if reuse_ids else None,
-                            ap_polygon=ap_polygon)
+            try:
+                ROIEditorWindow(self, z, roi_img_bkg, roi_img_mask, roi_masks, mc_corr_file,
+                                _on_finish, display_settings=self._display_settings,
+                                mc_img_bkg=mc_img_bkg,
+                                channels=channels, channel_loader=_load_channel,
+                                channel_default=ch_default, channel_note=mc_note,
+                                channel_luts=ch_luts,
+                                roi_ids=prev_rec.get("final_ids") if reuse_ids else None,
+                                n_detected=prev_rec.get("n_detected") if reuse_ids else None,
+                                next_id=prev_rec.get("next_id") if reuse_ids else None,
+                                ap_polygon=ap_polygon)
+            except Exception as e:
+                # without this the worker thread waits forever on a window that
+                # never opened and the pipeline hangs silently
+                result_holder[0] = e
+                self._log(traceback.format_exc())
+                done.set()
 
         self.after(0, _show)
         done.wait()
 
+        if isinstance(result_holder[0], Exception):
+            raise RuntimeError(f"ROI editor for {z} failed to open") from result_holder[0]
         new_masks, new_bkg, new_mask_img, settings, sreg_masks, record = result_holder[0]
 
         self._display_settings = settings
@@ -1264,6 +1279,7 @@ class PipelineGUI(ctk.CTk):
             _save_provenance(provenance)
 
         _all_stims_n: list[list[np.ndarray]] = []   # [animal][stim_idx] → (K, T)
+        _animal_labels: list[str] = []              # aligned with _all_stims_n
         _z_ids:  list[np.ndarray] = []
         _all_region_labels: list[np.ndarray] = []
         _all_spatial = []
@@ -1470,6 +1486,7 @@ class PipelineGUI(ctk.CTk):
 
                 # Accumulate per-animal stims,  each is a list of N arrays
                 _all_stims_n.append(stims_n)
+                _animal_labels.append(label)
                 _z_ids.append(z_ids)
 
                 # detected vs hand-added: how many respond?  Same criterion as
@@ -1487,32 +1504,25 @@ class PipelineGUI(ctk.CTk):
                     provenance, fp, pre_s, base_s, stim_s,
                     subregion_dir=out_dir)))
 
-                if self.do_subregion.get():
+                # AP / NTS label per neuron whenever an AP outline exists, so it is
+                # saved in neurons.csv even when the sub-region plots are not requested
+                sreg_files = {z: Path(out_dir) / z / f'subregion_masks_{z}.npy'
+                              for z in p["z_planes"]}
+                rlabels = np.full(stims_n[0].shape[0], -1, dtype=int)
+                if any(f.exists() for f in sreg_files.values()):
                     self._log("  Classifying neurons by sub-region …")
-                    found_any = any(
-                        (Path(out_dir) / z / f'subregion_masks_{z}.npy').exists()
-                        for z in p["z_planes"]
-                    )
-                    if not found_any:
+                    missing = [z for z, f in sreg_files.items() if not f.exists()]
+                    if missing:
                         self._log(
-                            "  ⚠ No subregion_masks_*.npy files found,  expected at:\n"
-                            + "\n".join(
-                                f"      {Path(out_dir) / z / f'subregion_masks_{z}.npy'}"
-                                for z in p["z_planes"])
-                            + "\n    Run 'Sub-region setup' (or CNMF) and outline the AP\n"
-                              "    in the ROI editor, then re-run analysis."
-                        )
-                        _all_region_labels.append(np.full(stims_n[0].shape[0], -1, dtype=int))
-                    else:
-                        missing = [z for z in p["z_planes"]
-                                   if not (Path(out_dir) / z / f'subregion_masks_{z}.npy').exists()]
-                        if missing:
-                            self._log(
-                                f"  ⚠ No AP outline for {', '.join(missing)}, their neurons stay\n"
-                                "    unclassified. Run 'Sub-region setup' to add them; planes\n"
-                                "    already outlined reopen with their AP restored.")
+                            f"  ⚠ No AP outline for {', '.join(missing)}, their neurons stay\n"
+                            "    unclassified. Run 'Sub-region setup' to add them; planes\n"
+                            "    already outlined reopen with their AP restored.")
+                    try:
                         rlabels = get_region_labels(provenance, out_dir)
-                        _all_region_labels.append(rlabels)
+                    except Exception:
+                        self._log("  ⚠ Sub-region classification failed:")
+                        self._log(traceback.format_exc())
+                    else:
                         n_a = int((rlabels == 0).sum())
                         n_b = int((rlabels == 1).sum())
                         n_none = int((rlabels == -1).sum())
@@ -1525,8 +1535,14 @@ class PipelineGUI(ctk.CTk):
                                 "  ⚠ All neurons are unclassified,  check that the\n"
                                 "    sub-region polygons cover the neurons on the canvas."
                             )
-                else:
-                    _all_region_labels.append(np.full(stims_n[0].shape[0], -1, dtype=int))
+                elif self.do_subregion.get():
+                    self._log(
+                        "  ⚠ No subregion_masks_*.npy files found,  expected at:\n"
+                        + "\n".join(f"      {f}" for f in sreg_files.values())
+                        + "\n    Run 'Sub-region setup' (or CNMF) and outline the AP\n"
+                          "    in the ROI editor, then re-run analysis."
+                    )
+                _all_region_labels.append(rlabels)
 
         if not ((self.do_analysis.get() or self.do_population.get() or
                  self.do_manifold.get()) and _all_stims_n):
@@ -1542,6 +1558,10 @@ class PipelineGUI(ctk.CTk):
             for j in range(N)
         ]
         z_ids_all = np.concatenate(_z_ids)
+        region_labels_all = (np.concatenate(_all_region_labels) if _all_region_labels
+                             else np.full(len(z_ids_all), -1, dtype=int))
+        mouse_labels_all = np.repeat(_animal_labels,
+                                     [s[0].shape[0] for s in _all_stims_n])
 
         # Extract centroids aligned with combined_stims_n (for manifold viewer)
         manifold_centroids = None
@@ -1585,7 +1605,9 @@ class PipelineGUI(ctk.CTk):
 
             results_dir = self._save_results(
                 results_parent, resp_n, nums, z_ids_resp, group_sizes, p,
-                stim_onset_idx, d["ses_f"])
+                stim_onset_idx, d["ses_f"],
+                stims_n=combined_stims_n, z_ids=z_ids_all,
+                region_labels=region_labels_all, mouse_labels=mouse_labels_all)
             self._log(f"Results saved to  {results_dir}")
 
             self._log("Opening figures …")
@@ -1601,7 +1623,6 @@ class PipelineGUI(ctk.CTk):
 
             # optional sub-region analysis
             if self.do_subregion.get() and _all_region_labels:
-                region_labels_all = np.concatenate(_all_region_labels)
                 region_results = {}
                 for reg_idx, reg_name in [(0, "AP"), (1, "NTS")]:
                     mask = region_labels_all == reg_idx
@@ -1688,8 +1709,16 @@ class PipelineGUI(ctk.CTk):
     # ── save results ───────────────────────────────────────────────────────
 
     def _save_results(self, out_dir: str, resp_n, nums, z_ids_resp, group_sizes,
-                      params: dict, stim_onset_idx: int, ses_f: int) -> str:
+                      params: dict, stim_onset_idx: int, ses_f: int, *,
+                      stims_n, z_ids, region_labels, mouse_labels) -> str:
+        """Save responder arrays plus the all-neuron table and traces.
+
+        stims_n / z_ids / region_labels / mouse_labels cover every neuron, in
+        the same row order; they become neurons.csv and traces_stim<j>.npy
+        (see analysis.results_io), which combine_mice.py reads.
+        """
         import yaml
+        from analysis.results_io import save_neuron_results, REGIONS
 
         results_dir = Path(out_dir) / "analysis"
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -1701,6 +1730,9 @@ class PipelineGUI(ctk.CTk):
         np.save(results_dir / "group_sizes.npy", np.array(group_sizes))
         np.save(results_dir / "z_ids_resp.npy",  z_ids_resp)
 
+        table = save_neuron_results(results_dir, stims_n, z_ids, region_labels,
+                                    mouse_labels, stim_onset_idx, params["threshold"])
+
         saved_params = dict(
             frame_period   = params["frame_period"],
             pre_discard_s  = params["pre_discard_s"],
@@ -1711,16 +1743,22 @@ class PipelineGUI(ctk.CTk):
             stim_onset_idx = stim_onset_idx,
             ses_f          = ses_f,
             z_planes       = params["z_planes"],
+            mice           = list(dict.fromkeys(table["mouse"])),
+            # all accepted neurons; n_responders is the unique responder count
+            n_total_neurons = len(table),
+            n_responders    = int(table["responder"].sum()),
         )
         if N == 2:
             saved_params.update(
                 n_stim1_only    = int(nums[0]),
                 n_both          = int(nums[1]),
                 n_stim2_only    = int(nums[2]),
-                n_total_neurons = int(sum(nums)),
             )
-        else:
-            saved_params["n_total_neurons"] = int(resp_n[0].shape[0])
+        for reg in REGIONS:
+            in_reg = table["region"] == reg
+            if in_reg.any():
+                saved_params[f"n_neurons_{reg}"]    = int(in_reg.sum())
+                saved_params[f"n_responders_{reg}"] = int(table.loc[in_reg, "responder"].sum())
         with open(results_dir / "params.yaml", "w") as f:
             yaml.safe_dump(saved_params, f, default_flow_style=False)
 

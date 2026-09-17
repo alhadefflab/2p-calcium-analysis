@@ -5,8 +5,9 @@ The editor hands over a record per z-plane; this module writes it to
 
     roi_curation_<z>.json      ids added / removed, polygons, counts, densities
     roi_curation_<z>_maps.npz  label images (stable ids) before and after, AP mask
-    roi_curation_<z>.png       screenshots: functional and tdTomato views, showing
-                               the edits (top row) and the AP / NTS split (bottom)
+    roi_curation_<z>_red.png   screenshots, one per reference LUT (red = tdTomato,
+    roi_curation_<z>_green.png green = GCaMP, merge = both), each showing the
+    roi_curation_<z>_merge.png edits (left) and the AP / NTS split (right)
 
 and later fills the record's ``yield`` section as the pipeline proceeds:
 how many of the ROIs, split by origin (Cellpose-detected vs hand-added) and by
@@ -198,7 +199,9 @@ def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
     `rec` keys (from ROIEditorWindow):
         n_detected, next_id, initial_labels, final_labels, final_ids,
         removal_reason {id: 'manual'|'region'}, exclusion_polygons, keep_mask,
-        ap_polygon, ap_mask, func_view, red_view, red_label
+        ap_polygon, ap_mask,
+        views [(key, title, (h, w, 3) uint8 image)], one screenshot file each
+        (older callers: func_view, red_view, red_label)
     `previous`, (record, maps) of an earlier save of this plane.  Given when
     the editor was reopened on already-curated ROIs (sub-region setup), so the
     original detected set and earlier edits are kept rather than overwritten.
@@ -294,13 +297,21 @@ def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
         ap_mask=(ap_mask if ap_mask is not None else np.zeros_like(keep)).astype(bool),
         has_ap=np.array(ap_mask is not None))
 
-    try:
-        _save_screenshots(d / f"roi_curation_{z}.png", z, summary, initial, final,
-                          n_detected, keep, ap_mask,
-                          rec.get("func_view"), rec.get("red_view"),
-                          rec.get("red_label") or "tdTomato")
-    except Exception as e:                       # a figure must never cost the record
-        summary["screenshot_error"] = repr(e)
+    views = rec.get("views")
+    if views is None:
+        views = [("functional", "Functional (GCaMP)", rec.get("func_view"))]
+        if rec.get("red_view") is not None:
+            views.append(("red", f"{rec.get('red_label') or 'tdTomato'} (red)",
+                          rec["red_view"]))
+    errors = {}
+    for key, title, img in views:
+        try:
+            _save_screenshots(d / f"roi_curation_{z}_{key}.png", z, summary, initial,
+                              final, n_detected, ap_mask, title, img)
+        except Exception as e:                   # a figure must never cost the record
+            errors[key] = repr(e)
+    if errors:
+        summary["screenshot_error"] = errors
     return summary
 
 # ── screenshots ───────────────────────────────────────────────────────────────
@@ -338,18 +349,16 @@ def _poly_xy(pts):
     p = np.asarray(pts, float)
     return np.vstack([p, p[:1]])
 
-def _save_screenshots(path, z, summary, initial, final, n_detected, keep, ap_mask,
-                      func_view, red_view, red_label):
+def _save_screenshots(path, z, summary, initial, final, n_detected, ap_mask, title, img):
+    """One view (e.g. the red LUT): edits on the left, AP / NTS on the right."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.collections import LineCollection
     from matplotlib.lines import Line2D
 
     h, w = final.shape
-    views = [("Functional (GCaMP)", func_view)]
-    if red_view is not None:
-        views.append((f"{red_label} (red)", red_view))
-    views = [(t, v if v is not None else np.zeros((h, w, 3), np.uint8)) for t, v in views]
+    if img is None:
+        img = np.zeros((h, w, 3), np.uint8)
 
     fin_ids = summary["final_ids"]
     groups_edit = [
@@ -372,31 +381,29 @@ def _save_screenshots(path, z, summary, initial, final, n_detected, keep, ap_mas
             segs_reg.append((name, _outline_segments(final, [i for i, r in zip(ids, reg)
                                                               if r == code]), "-", 1.1))
 
-    ncols = len(views)
-    fig = Figure(figsize=(6.2 * ncols, 12.8), dpi=150)
+    fig = Figure(figsize=(12.4, 6.9), dpi=150)
     FigureCanvasAgg(fig)
-    axes = fig.subplots(2, ncols, squeeze=False)
+    axes = fig.subplots(1, 2, squeeze=False)
 
-    for col, (title, img) in enumerate(views):
-        for row, segs in enumerate((segs_edit, segs_reg)):
-            ax = axes[row, col]
-            ax.imshow(img, interpolation="nearest")
-            for key, s, ls, lw in segs:
-                if s:
-                    ax.add_collection(LineCollection(s, colors=_COL[key],
-                                                     linestyles=ls, linewidths=lw))
-            for p in summary["exclusion_polygons"]:
-                xy = _poly_xy(p)
-                ax.plot(xy[:, 0], xy[:, 1], color=_COL["region"], lw=1.2, ls="--")
-            if summary["ap_polygon"]:
-                xy = _poly_xy(summary["ap_polygon"])
-                ax.plot(xy[:, 0], xy[:, 1], color="black", lw=3.2)
-                ax.plot(xy[:, 0], xy[:, 1], color=_COL["AP"], lw=1.8)
-            ax.set_xlim(0, w)
-            ax.set_ylim(h, 0)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_title(f"{title}: {'edits' if row == 0 else 'AP / NTS'}", fontsize=10)
+    for col, segs in enumerate((segs_edit, segs_reg)):
+        ax = axes[0, col]
+        ax.imshow(img, interpolation="nearest")
+        for key, s, ls, lw in segs:
+            if s:
+                ax.add_collection(LineCollection(s, colors=_COL[key],
+                                                 linestyles=ls, linewidths=lw))
+        for p in summary["exclusion_polygons"]:
+            xy = _poly_xy(p)
+            ax.plot(xy[:, 0], xy[:, 1], color=_COL["region"], lw=1.2, ls="--")
+        if summary["ap_polygon"]:
+            xy = _poly_xy(summary["ap_polygon"])
+            ax.plot(xy[:, 0], xy[:, 1], color="black", lw=3.2)
+            ax.plot(xy[:, 0], xy[:, 1], color=_COL["AP"], lw=1.8)
+        ax.set_xlim(0, w)
+        ax.set_ylim(h, 0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f"{title}: {'edits' if col == 0 else 'AP / NTS'}", fontsize=10)
 
     ac = summary["after_curation"]
     edit_handles = [
@@ -419,11 +426,11 @@ def _save_screenshots(path, z, summary, initial, final, n_detected, keep, ap_mas
             reg_handles.append(Line2D([], [], color=_COL[name], lw=2,
                                       label=f"{name}: {c} neurons, {a[name]} px², "
                                             f"{dn} / 10k px²"))
-        axes[1, 0].legend(handles=reg_handles, loc="lower left", fontsize=8,
+        axes[0, 1].legend(handles=reg_handles, loc="lower left", fontsize=8,
                           facecolor="black", labelcolor="white", framealpha=0.7)
     else:
-        axes[1, 0].text(0.5, 0.5, "No AP sub-region defined", color="white",
-                        ha="center", va="center", transform=axes[1, 0].transAxes,
+        axes[0, 1].text(0.5, 0.5, "No AP sub-region defined", color="white",
+                        ha="center", va="center", transform=axes[0, 1].transAxes,
                         fontsize=12, bbox=dict(facecolor="black", alpha=0.7))
 
     fig.suptitle(f"ROI curation: {z}   ·   detected {summary['n_detected']}  →  "

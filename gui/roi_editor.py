@@ -109,6 +109,9 @@ class ROIEditorWindow(ctk.CTkToplevel):
 
         self._z         = z
         self._on_finish = on_finish
+        roi_masks = np.asarray(roi_masks)
+        if roi_masks.ndim != 2:            # no ROIs detected on this plane
+            roi_masks = np.zeros((roi_img_bkg.shape[0] * roi_img_bkg.shape[1], 0), dtype=bool)
         self._roi_masks = roi_masks.copy()
         self._roi_bkg   = roi_img_bkg.copy()
         self._roi_msk   = roi_img_mask.copy()
@@ -1514,13 +1517,29 @@ class ROIEditorWindow(ctk.CTkToplevel):
         final_labels = label_image(self._roi_masks[:, nonempty],
                                    self._ih, self._iw, ids)[0]
 
-        red_view = None
+        # one screenshot per reference LUT, rendered exactly as the Red, Green and
+        # Merge buttons show them (same contrast settings and channel choice)
         struct = self._struct_bright() if self._struct_ch is not None else None
         if struct is None and self._mc_bkg is not None and self._ch_cur == self._struct_ch:
             struct = self._ref_stretch(self._mc_bkg)
+        func_ref = self._func_ref_bright()
+        func_roi = self._bright_bkg()
+
+        green_view = np.zeros_like(func_ref)
+        green_view[..., 1] = func_ref[..., 0]
+        merge_view = np.zeros_like(func_roi)
+        merge_view[..., 1] = func_roi[..., 0]
+        views = []
+        red_lbl = f"tdTomato · {self._struct_ch}" if self._struct_ch else "tdTomato"
         if struct is not None:
             red_view = np.zeros_like(struct)
             red_view[..., 0] = struct[..., 0]
+            merge_view[..., 0] = struct[..., 0]
+            views.append(("red", f"{red_lbl} (red)", red_view))
+        green_lbl = f"GCaMP · {self._func_ch}" if self._func_ch else "GCaMP"
+        views.append(("green", f"{green_lbl} (green)", green_view))
+        views.append(("merge", "Merge (tdTomato red + GCaMP green)" if struct is not None
+                      else "Merge (GCaMP only, no tdTomato loaded)", merge_view))
 
         return dict(
             n_detected=self._n_detected,
@@ -1534,9 +1553,7 @@ class ROIEditorWindow(ctk.CTkToplevel):
             keep_mask=self._keep_mask.copy(),
             ap_polygon=list(self._ap_pts) if self._ap_mask is not None else None,
             ap_mask=self._ap_mask,
-            func_view=self._bright_bkg(),
-            red_view=red_view,
-            red_label=f"tdTomato · {self._struct_ch}" if self._struct_ch else "tdTomato",
+            views=views,
         )
 
     def _do_finish(self):
