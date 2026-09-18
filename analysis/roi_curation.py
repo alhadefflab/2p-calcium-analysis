@@ -34,16 +34,20 @@ import numpy as np
 
 REGIONS  = ("AP", "NTS")
 ORIGINS  = ("detected", "added")
-STAGES   = ("rois", "traces", "accepted", "responsive")
+STAGES   = ("rois", "traces", "qc_passed", "accepted", "responsive")
 STAGE_LABELS = {
     "rois":       "ROIs after curation",
     "traces":     "CNMF traces",
+    "qc_passed":  "Passed CaImAn check",
     "accepted":   "Accepted (neuron viewer)",
     "responsive": "Responsive",
 }
-# densities are reported per 10 000 px² (a 100 × 100 px square); the pixel size
-# is not recorded in provenance, so there is no µm conversion here
+# densities are reported per 10 000 px² (a 100 × 100 px square) and, when the
+# pixel size is known (read from the Prairie View XML into provenance), also per
+# mm².  Both are kept side by side: µm is the physical figure, px is what the
+# images and the paper's Cellpose settings are expressed in.
 DENSITY_UNIT_PX = 10_000
+DENSITY_UNIT_UM2 = 1_000_000          # 1 mm² in µm²
 
 _SUBDIR = "roi_curation"
 
@@ -131,7 +135,34 @@ def _density(counts: dict, areas: dict) -> dict:
         out[k] = round(v * DENSITY_UNIT_PX / a, 3) if a else None
     return out
 
-def _count_block(ids, regions, n_detected, areas) -> dict:
+def areas_um2(areas_px: dict, um_per_px) -> dict | None:
+    """Areas in µm², or None when the pixel size is unknown."""
+    if not um_per_px:
+        return None
+    f = float(um_per_px) ** 2
+    return {k: (round(v * f, 1) if v else None) for k, v in areas_px.items()}
+
+def _density_mm2(counts: dict, areas_px: dict, um_per_px) -> dict | None:
+    """Neurons per mm², or None when the pixel size is unknown."""
+    if not um_per_px:
+        return None
+    f = float(um_per_px) ** 2
+    out = {}
+    for k, v in counts.items():
+        a = areas_px.get(k)
+        out[k] = round(v * DENSITY_UNIT_UM2 / (a * f), 2) if a else None
+    return out
+
+def _with_densities(count: dict, areas: dict, um_per_px) -> dict:
+    """{'count', 'density' (per 10k px²), 'density_mm2' (when µm/px is known)}."""
+    counts_valid = {k: v for k, v in count.items() if v is not None}
+    block = {"count": count, "density": _density(counts_valid, areas)}
+    d_mm2 = _density_mm2(counts_valid, areas, um_per_px)
+    if d_mm2 is not None:
+        block["density_mm2"] = d_mm2
+    return block
+
+def _count_block(ids, regions, n_detected, areas, um_per_px=None) -> dict:
     """Counts + densities split by origin (detected / added / all)."""
     ids = np.asarray(ids, dtype=int)
     regions = np.asarray(regions, dtype=int)
@@ -142,9 +173,7 @@ def _count_block(ids, regions, n_detected, areas) -> dict:
         c = _tally(regions[sel])
         if areas.get("AP") is None:            # no AP: only the total is meaningful
             c = {"AP": None, "NTS": None, "total": int(sel.sum())}
-        block[origin] = {"count": c,
-                         "density": _density({k: v for k, v in c.items() if v is not None},
-                                             areas)}
+        block[origin] = _with_densities(c, areas, um_per_px)
     return block
 
 # ── save / load ───────────────────────────────────────────────────────────────
@@ -193,7 +222,7 @@ def load_curated_masks(plane_dir, z, n_pixels=None):
     return masks, rec
 
 
-def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
+def save_curation(plane_dir, z, rec: dict, previous=None, um_per_px=None) -> dict:
     """Write the editor's record.  Returns the JSON summary that was written.
 
     `rec` keys (from ROIEditorWindow):
@@ -205,6 +234,8 @@ def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
     `previous`, (record, maps) of an earlier save of this plane.  Given when
     the editor was reopened on already-curated ROIs (sub-region setup), so the
     original detected set and earlier edits are kept rather than overwritten.
+    `um_per_px`, pixel size from the Prairie View XML (provenance).  When given,
+    areas and densities are recorded in µm as well as px.
     """
     d = curation_dir(plane_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -263,18 +294,20 @@ def save_curation(plane_dir, z, rec: dict, previous=None) -> dict:
         "ap_polygon": (np.asarray(rec["ap_polygon"], float).tolist()
                        if rec.get("ap_polygon") is not None else None),
         "area_px": areas,
+        "um_per_px": (float(um_per_px) if um_per_px else None),
+        "area_um2": areas_um2(areas, um_per_px),
         "density_unit": f"neurons per {DENSITY_UNIT_PX} px²",
+        "density_unit_mm2": "neurons per mm²" if um_per_px else None,
         # only detected neurons inside the kept (non-excluded) area count here,
         # so the before/after densities are over the same area
         "detected_before_curation": {
             "count": (_tally(init_reg) if ap_mask is not None
                       else {"AP": None, "NTS": None, "total": int((init_reg >= 0).sum())}),
         },
-        "after_curation": _count_block(fin_ids, fin_reg, n_detected, areas),
+        "after_curation": _count_block(fin_ids, fin_reg, n_detected, areas, um_per_px),
     }
     before = summary["detected_before_curation"]
-    before["density"] = _density({k: v for k, v in before["count"].items() if v is not None},
-                                 areas)
+    before.update(_with_densities(before["count"], areas, um_per_px))
     # keep yield figures from an earlier save only if the ROI set is unchanged
     # otherwise they describe a CNMF run on different seeds
     if prev_rec is not None and prev_rec.get("final_ids") == final_ids:
@@ -419,13 +452,16 @@ def _save_screenshots(path, z, summary, initial, final, n_detected, ap_mask, tit
 
     if ap_mask is not None:
         a = summary["area_px"]
+        a_um = summary.get("area_um2") or {}
+        d_mm2 = ac["all"].get("density_mm2") or {}
         reg_handles = []
         for name in REGIONS:
             c = ac["all"]["count"][name]
             dn = ac["all"]["density"].get(name)
-            reg_handles.append(Line2D([], [], color=_COL[name], lw=2,
-                                      label=f"{name}: {c} neurons, {a[name]} px², "
-                                            f"{dn} / 10k px²"))
+            label = f"{name}: {c} neurons, {a[name]} px², {dn} / 10k px²"
+            if a_um.get(name) and d_mm2.get(name):
+                label += f"  ({a_um[name]:.0f} µm², {d_mm2[name]:.0f} / mm²)"
+            reg_handles.append(Line2D([], [], color=_COL[name], lw=2, label=label))
         axes[0, 1].legend(handles=reg_handles, loc="lower left", fontsize=8,
                           facecolor="black", labelcolor="white", framealpha=0.7)
     else:
@@ -473,7 +509,7 @@ def match_components(A, final_labels: np.ndarray, min_frac: float = 0.3):
             ids[k] = int(u[best])
     return ids, centres
 
-def _stage_block(comp_ids, comp_regions, n_detected, areas, has_ap):
+def _stage_block(comp_ids, comp_regions, n_detected, areas, has_ap, um_per_px=None):
     block = {}
     for origin, sel in (("detected", (comp_ids >= 0) & (comp_ids < n_detected)),
                         ("added",    comp_ids >= n_detected),
@@ -484,18 +520,18 @@ def _stage_block(comp_ids, comp_regions, n_detected, areas, has_ap):
                  "total": int(sel.sum())}
         else:
             c = {"AP": None, "NTS": None, "total": int(sel.sum())}
-        block[origin] = {"count": c,
-                         "density": _density({k: v for k, v in c.items() if v is not None},
-                                             areas)}
+        block[origin] = _with_densities(c, areas, um_per_px)
     return block
 
-def update_yield(plane_dir, z, A, is_cell=None, responsive=None) -> dict | None:
+def update_yield(plane_dir, z, A, is_cell=None, responsive=None, qc_pass=None) -> dict | None:
     """Fill the record's `yield` section from a CNMF result.
 
     A          : CNMF spatial footprints (all components, before is_cell).
     is_cell    : (K,) bool, neuron-viewer acceptance, or None (all accepted).
     responsive : (K_accepted,) bool in is_cell order, or None to leave the
                  responsive stage as it was.
+    qc_pass    : (K,) bool, CaImAn's quality-check verdict, or None when the run
+                 saved none.  Gives the added-vs-dropped split after CNMF.
     Returns the updated yield dict, or None when the plane has no record.
     """
     rec, maps = load_curation(plane_dir, z)
@@ -514,17 +550,24 @@ def update_yield(plane_dir, z, A, is_cell=None, responsive=None) -> dict | None:
     if len(is_cell) != K:                       # stale is_cell from another CNMF run
         is_cell = np.ones(K, bool)
 
+    um_per_px = rec.get("um_per_px")
     y = dict(rec.get("yield") or {})
     y["rois"] = rec["after_curation"]
-    y["traces"] = _stage_block(comp_ids, comp_reg, n_detected, areas, has_ap)
+    y["traces"] = _stage_block(comp_ids, comp_reg, n_detected, areas, has_ap, um_per_px)
+    if qc_pass is not None:
+        qc_pass = np.asarray(qc_pass, bool)
+        if len(qc_pass) == K:
+            y["qc_passed"] = _stage_block(comp_ids[qc_pass], comp_reg[qc_pass],
+                                          n_detected, areas, has_ap, um_per_px)
+            y["qc_failed_ids"] = sorted({int(i) for i in comp_ids[~qc_pass] if i >= 0})
     y["accepted"] = _stage_block(comp_ids[is_cell], comp_reg[is_cell],
-                                 n_detected, areas, has_ap)
+                                 n_detected, areas, has_ap, um_per_px)
     if responsive is not None:
         responsive = np.asarray(responsive, bool)
         acc_ids, acc_reg = comp_ids[is_cell], comp_reg[is_cell]
         if len(responsive) == len(acc_ids):
             y["responsive"] = _stage_block(acc_ids[responsive], acc_reg[responsive],
-                                           n_detected, areas, has_ap)
+                                           n_detected, areas, has_ap, um_per_px)
     y["unmatched_components"] = int((comp_ids < 0).sum())
     y["updated"] = datetime.now().isoformat(timespec="seconds")
     rec["yield"] = y
@@ -565,6 +608,28 @@ def format_yield(z, y) -> list[str]:
 
 # ── animal-level summary ──────────────────────────────────────────────────────
 
+def _summary_row(rec, stage, origin, block, base) -> dict:
+    """One CSV row: counts, then densities in px and (when known) in µm."""
+    c = block["count"]
+    d = block.get("density") or {}
+    dm = block.get("density_mm2") or {}
+    area_px = rec.get("area_px") or {}
+    area_um = rec.get("area_um2") or {}
+    return {
+        "z": rec["z"], "stage": stage, "origin": origin,
+        "AP": c.get("AP"), "NTS": c.get("NTS"), "total": c["total"],
+        "pct_of_curated_rois": round(100 * c["total"] / base, 1) if base else None,
+        "AP_density_per_10k_px2": d.get("AP"),
+        "NTS_density_per_10k_px2": d.get("NTS"),
+        "total_density_per_10k_px2": d.get("total"),
+        "AP_density_per_mm2": dm.get("AP"),
+        "NTS_density_per_mm2": dm.get("NTS"),
+        "total_density_per_mm2": dm.get("total"),
+        "um_per_px": rec.get("um_per_px"),
+        "AP_area_px2": area_px.get("AP"), "NTS_area_px2": area_px.get("NTS"),
+        "AP_area_um2": (area_um or {}).get("AP"), "NTS_area_um2": (area_um or {}).get("NTS"),
+    }
+
 def write_summary(animal_dir) -> Path | None:
     """Collect every plane's record into roi_curation_summary.csv + .png."""
     animal_dir = Path(animal_dir)
@@ -585,25 +650,10 @@ def write_summary(animal_dir) -> Path | None:
             if st not in y:
                 continue
             for o in ORIGINS + ("all",):
-                c, d = y[st][o]["count"], y[st][o]["density"]
                 base = y["rois"][o]["count"]["total"]
-                rows.append({
-                    "z": r["z"], "stage": st, "origin": o,
-                    "AP": c.get("AP"), "NTS": c.get("NTS"), "total": c["total"],
-                    "pct_of_curated_rois": round(100 * c["total"] / base, 1) if base else None,
-                    "AP_density_per_10k_px2": d.get("AP"),
-                    "NTS_density_per_10k_px2": d.get("NTS"),
-                    "total_density_per_10k_px2": d.get("total"),
-                })
+                rows.append(_summary_row(r, st, o, y[st][o], base))
         b = r["detected_before_curation"]
-        rows.append({
-            "z": r["z"], "stage": "detected_before_curation", "origin": "detected",
-            "AP": b["count"].get("AP"), "NTS": b["count"].get("NTS"),
-            "total": b["count"]["total"], "pct_of_curated_rois": None,
-            "AP_density_per_10k_px2": b["density"].get("AP"),
-            "NTS_density_per_10k_px2": b["density"].get("NTS"),
-            "total_density_per_10k_px2": b["density"].get("total"),
-        })
+        rows.append(_summary_row(r, "detected_before_curation", "detected", b, None))
 
     csv_path = animal_dir / "roi_curation_summary.csv"
     with open(csv_path, "w", newline="") as f:

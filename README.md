@@ -190,7 +190,7 @@ The following parameters are set in the GUI **Timing** tab and saved to `params.
 | Baseline window | 30 s | Timing tab |
 | Stimulus duration | 180 s | Timing tab |
 | Frame period | 0.585 s/frame | Recording tab |
-| Cell diameter (Cellpose) | 15 px (or Auto) | Recording tab (Cellpose section) |
+| Cell diameter (Cellpose) | 18 px ≈ 21.8 µm (or Auto) | Recording tab (Cellpose section) |
 | Flow threshold (Cellpose) | 2.0 | Recording tab (Cellpose section) |
 | Cell probability threshold (Cellpose) | −1.0 | Recording tab (Cellpose section) |
 
@@ -198,8 +198,8 @@ Parameters **not** in the GUI; edit `params.py` directly:
 
 | Parameter | Default | Why you might change it |
 |-----------|---------|------------------------|
-| `CNMF_PARAMS["min_SNR"]` | 2.0 | Quality check: components with transient SNR above this pass; failures start rejected in the neuron viewer |
-| `CNMF_PARAMS["rval_thr"]` | 0.8 | Quality check: components with spatial correlation at or above this pass |
+| `CNMF_PARAMS["min_SNR"]` | 1.5 | Quality check: components with transient SNR above this pass; failures start rejected in the neuron viewer (CaImAn's default is 2.5, its seeded demo uses 1.5) |
+| `CNMF_PARAMS["rval_thr"]` | 0.6 | Quality check: components at or above this spatial correlation pass. Lowered from CaImAn's 0.8 because the correlation here is computed on deep, dense tissue |
 | `CNMF_PARAMS["decay_time"]` | 1.8 s | Calcium indicator decay constant (1.8 s for GCaMP6s, ~0.4 s for faster indicators) |
 | `CNMF_PARAMS["p"]` | 2 | AR model order (2 for GCaMP6s, 1 for faster indicators) |
 

@@ -306,6 +306,8 @@ class NeuronViewerWindow(ctk.CTkToplevel):
                    session_lengths — enables trace region annotations
     qc_thresholds: optional dict with keys min_SNR, rval_thr, SNR_lowest —
                    CaImAn quality-check thresholds shown next to each neuron's scores
+    um_per_px    : optional pixel size; when given, areas are shown in µm² as
+                   well as px
     """
 
     def __init__(
@@ -317,6 +319,7 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         on_close=None,
         timing_info: dict | None = None,
         qc_thresholds: dict | None = None,
+        um_per_px: float | None = None,
     ):
         super().__init__(parent)
         self.title("Neuron Viewer — Post-CNMF Curation")
@@ -327,6 +330,7 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         self._on_close_cb = on_close
         self._timing_info    = timing_info
         self._qc_thr         = qc_thresholds or {}
+        self._um_per_px      = um_per_px
         self._selected       = 0
         self._legend_visible = False
         self._popout: _TracePopout | None = None
@@ -660,8 +664,15 @@ class NeuronViewerWindow(ctk.CTkToplevel):
         cy, cx = n.centroid
         peak_sd = float(n.trace_raw.max() / (n.trace_raw.std() + 1e-9))
         peak = float(n.trace_raw.max())
+        if self._um_per_px:
+            um = self._um_per_px
+            area_txt = f'Area: {area} px ({area * um * um:.0f} µm²)'
+            pos_txt = f'Centroid: ({cx}, {cy}) px  ({cx * um:.0f}, {cy * um:.0f}) µm'
+        else:
+            area_txt = f'Area: {area} px'
+            pos_txt = f'Centroid: ({cx}, {cy}) px'
         self._info_label.configure(
-            text=f'Centroid: ({cx}, {cy})   Area: {area} px   Peak: {peak:.1f}   Peak/SD: {peak_sd:.1f}')
+            text=f'{pos_txt}   {area_txt}   Peak: {peak:.1f}   Peak/SD: {peak_sd:.1f}')
 
         self._refresh_image()
 

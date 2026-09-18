@@ -153,7 +153,8 @@ class ZPlaneViewerWindow(ctk.CTkToplevel):
     on_close   : callback({z: updated_is_cell_array, …})
     """
 
-    def __init__(self, parent, plane_data: list[dict], on_close=None):
+    def __init__(self, parent, plane_data: list[dict], on_close=None,
+                 um_per_px: float | None = None, z_step_um: float | None = None):
         super().__init__(parent)
         self.title("Multi-plane Neuron Map — Duplicate Review")
         self.resizable(True, True)
@@ -169,7 +170,10 @@ class ZPlaneViewerWindow(ctk.CTkToplevel):
         self._iou_thr  = _DEFAULT_IOU_MIN
         self._corr_thr = _DEFAULT_CORR_MIN
         self._search   = ''
-        self._z_step_um: float | None = None   # set by caller if known
+        # from the Prairie View XML (provenance) when known: distances are then
+        # reported in px and µm side by side
+        self._um_per_px: float | None = um_per_px
+        self._z_step_um: float | None = z_step_um
 
         self._duplicates = _find_duplicates(
             plane_data, self._decisions, self._iou_thr, self._corr_thr)
@@ -494,8 +498,10 @@ class ZPlaneViewerWindow(ctk.CTkToplevel):
         n1, n2 = dup['n1'], dup['n2']
         cy1, cx1 = n1.centroid
         cy2, cx2 = n2.centroid
+        dist_txt = (f'{dup["dist"]:.0f} px ({dup["dist"] * self._um_per_px:.0f} µm)'
+                    if self._um_per_px else f'{dup["dist"]:.0f} px')
         info = (f'IoU {dup["iou"]:.3f}   r = {dup["corr"]:.3f}'
-                f'   dist {dup["dist"]:.0f} px{status_str}\n'
+                f'   dist {dist_txt}{status_str}\n'
                 f'{dup["id1"]} ({cx1},{cy1})  peak {n1.trace_raw.max():.1f}  |  '
                 f'{dup["id2"]} ({cx2},{cy2})  peak {n2.trace_raw.max():.1f}')
         ctk.CTkLabel(card, text=info, text_color='gray',

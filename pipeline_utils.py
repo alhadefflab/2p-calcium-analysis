@@ -14,6 +14,62 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 
+# ── image scale (µm per pixel) ────────────────────────────────────────────────
+# Prairie View records the pixel size for the objective and zoom in use.  It is
+# the only place it exists: the TIFFs and provenance do not carry it, so every
+# µm figure in the pipeline comes from here.
+
+def read_microns_per_pixel(session_dir):
+    """{'x': µm, 'y': µm, 'z': µm or None} from a session's Prairie View XML.
+
+    Returns None when no XML with a micronsPerPixel entry is found.  Only the
+    file header is parsed (everything before the first <Sequence>), so the size
+    of the per-frame records does not matter.
+    """
+    import xml.etree.ElementTree as ET
+
+    session = Path(session_dir)
+    for xml in sorted(session.glob('*.xml')):
+        if 'Cycle' in xml.name:          # per-cycle files carry no header
+            continue
+        try:
+            for ev, el in ET.iterparse(xml, events=('start', 'end')):
+                if ev == 'start' and el.tag == 'Sequence':
+                    break                # past the header
+                if (ev == 'end' and el.tag == 'PVStateValue'
+                        and el.attrib.get('key') == 'micronsPerPixel'):
+                    vals = {}
+                    for iv in el.findall('IndexedValue'):
+                        axis = str(iv.attrib.get('index', '')).lower()[:1]
+                        try:
+                            vals[axis] = float(iv.attrib['value'])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    if 'x' in vals and 'y' in vals:
+                        return {'x': vals['x'], 'y': vals['y'], 'z': vals.get('z')}
+        except (ET.ParseError, OSError):
+            continue
+    return None
+
+
+def scale_of(provenance):
+    """The recorded scale dict for a project, or None.
+
+    Keys: um_per_px (x, used for areas and distances), um_per_px_x, um_per_px_y,
+    z_step_um, per_session, warnings.
+    """
+    try:
+        return (provenance.get('load_data') or {}).get('scale') or None
+    except AttributeError:
+        return None
+
+
+def um_per_px_of(provenance):
+    """µm per pixel for a project, or None when the XMLs were not readable."""
+    s = scale_of(provenance)
+    return float(s['um_per_px']) if s and s.get('um_per_px') else None
+
+
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
     __getattr__ = dict.get
