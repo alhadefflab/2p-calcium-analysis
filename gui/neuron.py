@@ -13,6 +13,9 @@ class Neuron:
     trace_denoised: np.ndarray   # (T,) float — C only
     centroid: tuple[int, int]    # (row, col) weighted by spatial footprint
     accepted: bool = True
+    snr: float | None = None       # CaImAn transient SNR (estimates.SNR_comp)
+    r_value: float | None = None   # CaImAn spatial correlation (estimates.r_values)
+    passed_qc: bool | None = None  # CaImAn quality-check verdict; None = no verdict saved
 
     @classmethod
     def from_cnmf(cls, estimates, k: int, dims=None) -> 'Neuron':
@@ -55,10 +58,43 @@ class Neuron:
 
     @classmethod
     def build_all(cls, estimates, dims=None) -> list['Neuron']:
-        """Build one Neuron per accepted component in a CNMF estimates object.
+        """Build one Neuron per component in a CNMF estimates object.
+
+        CaImAn's quality scores are attached when present.  If the pass / fail
+        lists from ``evaluate_components`` are saved (``idx_components`` and
+        ``idx_components_bad`` covering every component), each neuron starts
+        accepted only if it passed; failures start rejected for review.  Files
+        without a verdict (e.g. older runs that deleted failures) start all
+        accepted, as before.
 
         Pass ``cnm.dims`` as ``dims`` for objects straight from ``cnm.fit()``;
         ``estimates.dims`` alone is unreliable there (see ``from_cnmf``).
         """
         K = estimates.A.shape[1]
-        return [cls.from_cnmf(estimates, k, dims=dims) for k in range(K)]
+        neurons = [cls.from_cnmf(estimates, k, dims=dims) for k in range(K)]
+
+        snr = _per_component(getattr(estimates, 'SNR_comp', None), K)
+        rval = _per_component(getattr(estimates, 'r_values', None), K)
+        good = getattr(estimates, 'idx_components', None)
+        bad = getattr(estimates, 'idx_components_bad', None)
+        has_verdict = (good is not None and bad is not None
+                       and len(good) + len(bad) == K)
+        good_set = {int(i) for i in good} if has_verdict else set()
+
+        for k, n in enumerate(neurons):
+            if snr is not None:
+                n.snr = float(snr[k])
+            if rval is not None:
+                n.r_value = float(rval[k])
+            if has_verdict:
+                n.passed_qc = k in good_set
+                n.accepted = n.passed_qc
+        return neurons
+
+
+def _per_component(values, K):
+    """values as a (K,) array, or None when missing or not one value per component."""
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float).ravel()
+    return arr if arr.size == K else None

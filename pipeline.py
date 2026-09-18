@@ -121,13 +121,84 @@ def load_data(provenance, multi_path, ch_dict, z, multi_crop=False, multi_crop_s
     data = _load_data(filenames, ch_dict, z, multi_crop, multi_crop_start)
 
     provenance['load_data']['args'] = kwargs['__args_dict']
-    provenance['load_data']['filenames'] = filenames 
+    provenance['load_data']['filenames'] = filenames
+
+    _record_scale(provenance, multi_path)
 
     _save_provenance(provenance)
-    return provenance, data      
+    return provenance, data
 
 
+def _read_scale(multi_path):
+    """µm per pixel and z step from the session XMLs, or None.
 
+    Records a warning when sessions disagree or x and y differ, rather than
+    picking silently: a wrong pixel size would put every µm figure out by a
+    constant factor.
+    """
+    from pipeline_utils import read_microns_per_pixel
+
+    per_session = {}
+    for i, session in enumerate(multi_path):
+        got = read_microns_per_pixel(session)
+        if got:
+            per_session[str(i)] = got
+    if not per_session:
+        return None
+
+    first = per_session[min(per_session)]
+    xs = {round(v['x'], 6) for v in per_session.values()}
+    ys = {round(v['y'], 6) for v in per_session.values()}
+    zs = {round(v['z'], 6) for v in per_session.values() if v.get('z') is not None}
+    warnings = []
+    if len(xs) > 1 or len(ys) > 1:
+        warnings.append(f"sessions disagree on µm/px (x {sorted(xs)}, y {sorted(ys)}), "
+                        f"using session {min(per_session)}")
+    if abs(first['x'] - first['y']) > 1e-6:
+        warnings.append(f"x and y µm/px differ ({first['x']} vs {first['y']}), using x")
+    if len(zs) > 1:
+        warnings.append(f"sessions disagree on z step ({sorted(zs)})")
+
+    scale = {'um_per_px': float(first['x']),
+             'um_per_px_x': float(first['x']),
+             'um_per_px_y': float(first['y']),
+             'z_step_um': (float(first['z']) if first.get('z') is not None else None),
+             'per_session': per_session}
+    if warnings:
+        scale['warnings'] = warnings
+    return scale
+
+
+def _record_scale(provenance, multi_path):
+    """Store the pixel size in provenance (idempotent).  Returns the scale or None."""
+    scale = _read_scale(multi_path)
+    if not scale:
+        print("  ⚠ Could not read micronsPerPixel from the session XML; "
+              "areas and distances stay in pixels")
+        return None
+    for w in scale.get('warnings', []):
+        print(f"  ⚠ {w}")
+    z_txt = f"{scale['z_step_um']:g} µm" if scale['z_step_um'] else "unknown"
+    print(f"  Pixel size {scale['um_per_px']:.4f} µm/px, z step {z_txt}")
+    provenance['load_data']['scale'] = scale
+    return scale
+
+
+def ensure_scale(provenance):
+    """Backfill the pixel size for a project processed before it was recorded.
+
+    Re-reads the session XMLs named in provenance; nothing else is re-run.
+    """
+    ld = provenance.get('load_data') or {}
+    if ld.get('scale'):
+        return ld['scale']
+    paths = ((ld.get('args') or {}).get('multi_path')) or []
+    if not paths:
+        return None
+    scale = _record_scale(provenance, paths)
+    if scale:
+        _save_provenance(provenance)
+    return scale
 
 #
 def restore_affine_correction(provenance, z):
@@ -438,18 +509,19 @@ def rigid_motion_correction(provenance, z, affcorr_results, nprocs=None, max_shi
 
 #
 def _identify_rois(output_dir, func_ch_file, z, method='max', filt=True, kern=1,
-                    flow_threshold=2, cellprob_threshold=-1, diameter=15,
+                    flow_threshold=2, cellprob_threshold=-1, diameter=18,
                     model_type='cyto3', gpu=_USE_GPU, show_figs=True,
                     roi_masks_override=None):
 
     """
-    "method" :'max', 
+    "method" :'max',
     "filt" : True, # whether or not to spatially filter the resulting image
-    "kern" : 1,      # kernel size of filter 
-    "channels" : [[0,0]], 
-    "flow_threshold" : 2, 
-    "cellprob_threshold" : -1, 
-    "diameter" : 15, 
+    "kern" : 1,      # kernel size of filter
+    "channels" : [[0,0]],
+    "flow_threshold" : 2,       # KP's value (unitless)
+    "cellprob_threshold" : -1,  # KP's value (unitless)
+    "diameter" : 18,  # KP used 15 px at 1.458 µm/px (746.5 µm / 512 px) ≈ 21.9 µm;
+                      # at our 1.2109 µm/px that is 21.9 / 1.2109 ≈ 18 px
     "model_type" : 'cyto',
     'show_figs' : True   # show figures
     'roi_masks_override' : None  # (h*w, N) masks to use instead of running Cellpose
@@ -572,36 +644,41 @@ def _addremove_rois_manually(output_dir, mc_ch_rigcorr_file, z, roi_masks0, roi_
 
  
 
-def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
-            rf=None, only_init=False, min_SNR=2.0, use_cnn=False, use_cuda=_USE_GPU,
+def _run_cnmf(output_dir, z, func_ch_file, roi_masks, fr, decay_time=1.8, p=2, nb=2,
+            rf=None, only_init=False, min_SNR=2.0, rval_thr=0.8, use_cnn=False, use_cuda=_USE_GPU,
             K=300, gSig=[10,10], max_processes=None):
+    """Seeded CNMF on one plane, followed by CaImAn's quality check.
 
+    fr : imaging rate of this plane in Hz (1 / frame period, 1.71 Hz for 6 planes
+         at 0.585 s).  Required: CaImAn's default of 30 Hz is wrong for volumetric
+         data.  CaImAn only uses it in the quality check, to size the transient
+         window for the SNR test (fr * decay_time frames) and the window around
+         activity peaks for the spatial correlation test.
+    max_processes : worker cap; None = cores - 1.  The actual count is sized to
+         free RAM at run time (worker_budget.py)
 
+    No component is deleted.  evaluate_components leaves SNR_comp, r_values and
+    the pass / fail index lists (idx_components, idx_components_bad) on
+    cnm.estimates, and they are saved with the CNMF file.  The neuron viewer
+    starts failing components as rejected, so they are reviewed instead of
+    silently removed.  A component passes if r >= rval_thr or SNR > min_SNR, and
+    always fails if SNR <= 0.5 (CaImAn's SNR_lowest).
     """
-    'max_processes': None, # worker cap; None = cores - 1.  The actual count is
-                           # sized to free RAM at run time (worker_budget.py)
-
-    'fr': MCVID_PARAMS['fr'],
-    'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
-    'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
-    'nb': 2, # the number of background components, 
-    'rf': None, #must be None for seeded mode
-    'only_init':False, #must be false for seeded mode
-    'min_SNR': 2.0,
-    'use_cnn': False, # whether or not to use a convolutional neural network to classify rois as good or bad
-    'use_cuda':False, # whether or not to use GPUs
-
-    ## the rest of these are necessary parameters to set for that get ignored
-    ## since we are seeding the algorithm for initialization
-    'K': 300,  
-    'gSig':[10,10]
-    """
-    inputs = locals()
-    inputs.pop('output_dir')
-    inputs.pop('z')
-    inputs.pop('func_ch_file')
-    inputs.pop('roi_masks')
-    inputs.pop('max_processes')
+    inputs = {
+        'fr': fr,
+        'decay_time': decay_time,  # 1.8 s for GCaMP6s, ~0.4 s for faster indicators
+        'p': p,                    # AR order: 2 for GCaMP6s, 1 for faster indicators
+        'nb': nb,                  # number of background components
+        'rf': rf,                  # must be None for seeded mode
+        'only_init': only_init,    # must be False for seeded mode
+        'min_SNR': min_SNR,        # quality check: transient SNR threshold
+        'rval_thr': rval_thr,      # quality check: spatial correlation threshold
+        'use_cnn': use_cnn,        # CNN classifier in the quality check
+        'use_cuda': use_cuda,
+        # required by CNMFParams, ignored when CNMF is seeded
+        'K': K,
+        'gSig': gSig,
+    }
 
     from caiman.source_extraction.cnmf import cnmf
     from caiman.source_extraction.cnmf import params
@@ -626,8 +703,8 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
             cnm = cnmf.CNMF(n_processes, params=opts, dview=dview, Ain=roi_masks)
             cnm.fit(f_ch_rigcorr)  # modifies in place in CaImAn 1.13+
 
+            # scores every component; no select_components, so nothing is removed
             cnm.estimates.evaluate_components(f_ch_rigcorr, cnm.params, dview=dview)
-            cnm.estimates.select_components(use_object=True)
             break
         except MemoryError:
             # other programs may have taken memory since the plan was made
@@ -640,10 +717,53 @@ def _run_cnmf(output_dir, z, func_ch_file, roi_masks, decay_time=1.8, p=2, nb=2,
 
     cnm.dview = None  # must be None before save so file is marked correctly
 
+    _apply_corrected_spatial_correlation(cnm, Yr, fr, rval_thr=rval_thr, min_SNR=min_SNR)
+
+    n_pass = len(cnm.estimates.idx_components)
+    print(f"  Quality check (fr = {fr:.3f} Hz): {n_pass} / {cnm.estimates.A.shape[1]} "
+          f"components passed; failures are kept and start rejected in the neuron viewer")
+
     cnmf_file = output_dir / f'concat_{z}_cnmf-out.hdf5'
     cnm.save(cnmf_file.as_posix())
 
     return cnm, cnmf_file
+
+
+def _apply_corrected_spatial_correlation(cnm, Yr, fr, rval_thr=0.8, min_SNR=2.0):
+    """Replace CaImAn's spatial correlation with the background-corrected one.
+
+    CaImAn's r_values correlate the footprint against the *raw* movie averaged
+    over active frames, so neuropil and co-active neighbours drag it down: in
+    this data real neurons routinely score below 0.5.  The documented metric
+    subtracts the other components first, which is what analysis.spatial_quality
+    computes.  SNR is left exactly as CaImAn computed it.
+
+    Keeps CaImAn's value as `r_values_caiman` and re-derives idx_components /
+    idx_components_bad from the corrected r, using the same accept rule.
+    """
+    from analysis.spatial_quality import corrected_spatial_correlation, quality_verdict
+
+    est = cnm.estimates
+    try:
+        r_corr = corrected_spatial_correlation(Yr, est.A, est.C, est.b, est.f)
+    except Exception as e:                       # never lose a finished CNMF fit to this
+        print(f"  ⚠ corrected spatial correlation failed ({e!r}); keeping CaImAn's r_values")
+        return
+
+    r_caiman = np.asarray(est.r_values, dtype=float) if est.r_values is not None else None
+    snr = np.asarray(est.SNR_comp, dtype=float)
+    passed, idx_good, idx_bad = quality_verdict(r_corr, snr, min_SNR=min_SNR, rval_thr=rval_thr)
+
+    est.r_values_caiman = r_caiman
+    est.r_values = r_corr
+    est.idx_components = idx_good.astype(int)
+    est.idx_components_bad = idx_bad.astype(int)
+
+    if r_caiman is not None and len(r_caiman) == len(r_corr):
+        gained = int(((r_corr >= rval_thr) & (r_caiman < rval_thr)).sum())
+        print(f"  Spatial correlation (background + neighbours removed): median "
+              f"{np.median(r_caiman):.2f} → {np.median(r_corr):.2f}, "
+              f"{gained} component(s) now pass on shape")
 
 
 def _save_source_extraction_video(cnm, z, output_dir):
@@ -765,7 +885,13 @@ def source_extraction(provenance, data_array, z, mc, idroi_params={}, runcnmf_pa
         _save_provenance(provenance)
         return provenance
 
-    cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **runcnmf_params)
+    # CNMF_PARAMS holds the defaults; runcnmf_params overrides them and must carry fr
+    from params import CNMF_PARAMS
+    cnmf_kwargs = {**CNMF_PARAMS, **runcnmf_params}
+    if 'fr' not in cnmf_kwargs:
+        raise ValueError("source_extraction needs runcnmf_params['fr'] (imaging rate per plane, "
+                         "1 / frame period); CaImAn's 30 Hz default is wrong for this data")
+    cnm, cnm_file = _run_cnmf(output_dir, z, func_corr_file, roi_masks, **cnmf_kwargs)
 
     # Optional post-CNMF interactive neuron curation
     _is_cell_file = None

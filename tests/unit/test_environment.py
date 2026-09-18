@@ -39,8 +39,9 @@ def test_cnmf_params_accepts_project_params():
     from caiman.source_extraction.cnmf import params as cnmf_params
     import params as project_params
 
-    # fr is derived at runtime — exclude it from the dict test
-    test_dict = {k: v for k, v in project_params.CNMF_PARAMS.items() if k != "fr"}
+    # fr is not in CNMF_PARAMS (passed at run time); add a realistic value
+    assert "fr" not in project_params.CNMF_PARAMS
+    test_dict = {**project_params.CNMF_PARAMS, "fr": 1 / 0.585}
     cnmf_params.CNMFParams(params_dict=test_dict)
 
 

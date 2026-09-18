@@ -58,28 +58,45 @@ MCVID_PARAMS['fps'] = MCVID_PARAMS['speed_up'] * MCVID_PARAMS['fr'] * MCVID_PARA
 
 
 # settings for identifying rois
+#
+# Cellpose diameter is in pixels, so KP's value cannot be used as it stands.
+# KP (Huang et al. 2024) used diameter = 15 px at their pixel size, a 746.5 µm
+# field over 512 px = 1.458 µm/px, so about 15 × 1.458 = 21.9 µm cells.  Our
+# pixel size is 1.2109 µm (620 µm over 512 px), giving 21.9 / 1.2109 ≈ 18 px.
+# flow_threshold and cellprob_threshold are unitless and carry over unchanged.
 IDROI_PARAMS = {
-    "method" :'max', 
+    "method" :'max',
     "filt" : True, # whether or not to spatially filter the resulting image
-    "kern" : 1,      # kernel size of filter 
-    "flow_threshold" : 2,
-    "cellprob_threshold" : -1,
-    "diameter" : 15,
+    "kern" : 1,      # kernel size of filter
+    "flow_threshold" : 2,      # KP's value
+    "cellprob_threshold" : -1, # KP's value
+    "diameter" : 18,           # KP's 15 px at 1.458 µm/px, converted to our 1.2109 µm/px
     "model_type" : 'cyto3',  # cyto3 is the recommended model in Cellpose 4.x
     "gpu" : USE_GPU,
     'show_figs' : True   # show figures
 }
 
 
-#set parameters for source extraction
+#set parameters for source extraction (defaults for pipeline._run_cnmf)
+# 'fr' is deliberately absent: it is the imaging rate per plane, 1 / frame period,
+# and is passed at run time from the GUI's frame period (runcnmf_params)
 CNMF_PARAMS = {
-    'fr': MCVID_PARAMS['fr'],
     'decay_time': 1.8, # this should be set to 1.8 for GCamp6s, but can be changed to 0.4 for faster indicators
     'p': 2, # this must be 2 for GCamp6s, it can be set to 1 for faster indicators
-    'nb': 2, # the number of background components, 
+    'nb': 2, # the number of background components,
     'rf': None, #must be None for seeded mode
     'only_init':False, #must be false for seeded mode
-    'min_SNR': 2.0,
+    # Quality check thresholds.  A component passes on EITHER metric, and always
+    # fails below CaImAn's absolute floors (SNR_lowest 0.5, rval_lowest -1).
+    # CaImAn's defaults (2.5 / 0.8) and its seeded demo (1.5 / 0.8) assume brief
+    # transients in bright tissue.  Here responses are sustained (the SNR test
+    # detrends them away) and the tissue is deep and dense, so both metrics run
+    # low: on ZH543 z1, 23/89 components exceed SNR 2.0 and 22/89 exceed r 0.8,
+    # while only 6/89 fall below r 0.4.  These values keep that judgement usable
+    # rather than rejecting most real neurons.  Nothing is deleted either way;
+    # the verdict only sets the starting state in the neuron viewer.
+    'min_SNR': 1.5,      # quality check: components with transient SNR above this pass
+    'rval_thr': 0.6,     # quality check: components with spatial correlation at or above this pass
     'use_cnn': False,    # set True to enable PyTorch CNN quality classifier (requires new CaImAn)
     'use_cuda': USE_GPU,
 

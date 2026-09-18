@@ -11,8 +11,8 @@ The pipeline takes raw multi-channel `.tif` stacks from two-photon microscopy se
 2. **Affine motion correction**: inter-session alignment using `pystackreg`; reference image generated from the middle 50% of frames
 3. **Rigid / piecewise-rigid motion correction**: fine-grained within-session correction using [CaImAn](https://github.com/flatironinstitute/CaImAn)
 4. **ROI identification**: cell segmentation via [Cellpose](https://github.com/MouseLand/cellpose) in seeded mode
-5. **Source extraction (CNMF)**: constrained nonnegative matrix factorization via CaImAn; seeded by Cellpose masks; followed by `evaluate_components` + `select_components` to remove noise and neuropil components before traces are saved
-6. **Neuron curation**: post-CNMF interactive browser (`gui/neuron_viewer.py`); inspect individual fluorescence traces and calcium mini-video; accept or reject components; saves `is_cell` mask per z-plane without re-running CNMF
+5. **Source extraction (CNMF)**: constrained nonnegative matrix factorization via CaImAn; seeded by Cellpose masks; followed by `evaluate_components`, which scores every component (transient SNR, spatial correlation) using the imaging rate per plane (`fr = 1 / frame period`). No component is deleted: the scores and pass/fail verdict are saved with the CNMF file
+6. **Neuron curation**: post-CNMF interactive browser (`gui/neuron_viewer.py`); inspect individual fluorescence traces and calcium mini-video; accept or reject components; components that failed CaImAn's check start rejected and show their SNR, r and the reason; saves `is_cell` mask per z-plane without re-running CNMF
 7. **Multi-plane duplicate review**: cross-z-plane duplicate detection using Jaccard IoU of spatial masks and trace correlation 3-D neuron reconstruction via plotly; interactive resolution per pair; see `docs/multiplane_duplicate_review.md`
 8. **Analysis & visualization**: stimulus-aligned response analysis (`pipeline_funcs.py`) and plots via matplotlib (`visualization/response_plots.py`); `is_cell` masks from curation and duplicate review are applied automatically
 9. **GUI**: `gui.py` is the only entry point for running the analysis. It replaces manual editing of hardcoded frame numbers: timing is entered in seconds and frame counts are computed automatically from the actual frame period. Supports single and multi-animal experiments, and 1-4 stimulus conditions. See **Usage** below.
@@ -190,7 +190,7 @@ The following parameters are set in the GUI **Timing** tab and saved to `params.
 | Baseline window | 30 s | Timing tab |
 | Stimulus duration | 180 s | Timing tab |
 | Frame period | 0.585 s/frame | Recording tab |
-| Cell diameter (Cellpose) | 15 px (or Auto) | Recording tab (Cellpose section) |
+| Cell diameter (Cellpose) | 18 px ≈ 21.8 µm (or Auto) | Recording tab (Cellpose section) |
 | Flow threshold (Cellpose) | 2.0 | Recording tab (Cellpose section) |
 | Cell probability threshold (Cellpose) | −1.0 | Recording tab (Cellpose section) |
 
@@ -198,7 +198,8 @@ Parameters **not** in the GUI; edit `params.py` directly:
 
 | Parameter | Default | Why you might change it |
 |-----------|---------|------------------------|
-| `CNMF_PARAMS["min_SNR"]` | 2.0 | Minimum SNR for a CNMF component to be accepted; raise to reject more noise |
+| `CNMF_PARAMS["min_SNR"]` | 1.5 | Quality check: components with transient SNR above this pass; failures start rejected in the neuron viewer (CaImAn's default is 2.5, its seeded demo uses 1.5) |
+| `CNMF_PARAMS["rval_thr"]` | 0.6 | Quality check: components at or above this spatial correlation pass. Lowered from CaImAn's 0.8 because the correlation here is computed on deep, dense tissue |
 | `CNMF_PARAMS["decay_time"]` | 1.8 s | Calcium indicator decay constant (1.8 s for GCaMP6s, ~0.4 s for faster indicators) |
 | `CNMF_PARAMS["p"]` | 2 | AR model order (2 for GCaMP6s, 1 for faster indicators) |
 

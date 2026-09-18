@@ -64,6 +64,24 @@ def _stage_status(prov: dict) -> dict[str, bool]:
     return dict(mc=mc_done, cnmf=cnmf_done)
 
 
+def _qc_pass_mask(estimates):
+    """(K,) bool of CaImAn's quality-check verdict, or None when none was saved.
+
+    Runs that deleted failing components (before the flag-don't-delete change)
+    store the index lists as None, so those planes report no verdict.
+    """
+    good = getattr(estimates, "idx_components", None)
+    bad  = getattr(estimates, "idx_components_bad", None)
+    if good is None or bad is None:
+        return None
+    K = estimates.A.shape[1]
+    if len(good) + len(bad) != K:
+        return None
+    mask = np.zeros(K, dtype=bool)
+    mask[np.asarray(good, dtype=int)] = True
+    return mask
+
+
 # ── animal row widget ─────────────────────────────────────────────────────────
 
 class AnimalRow(ctk.CTkFrame):
@@ -344,6 +362,16 @@ class PipelineGUI(ctk.CTk):
         self._check_provenance()
         self.tabs.set("Run")
 
+    def _sync_resume_curation(self):
+        """Resume is a sub-option of CNMF: disabled and unticked while CNMF is off."""
+        if not hasattr(self, "resume_curation"):
+            return
+        if self.do_cnmf.get():
+            self.resume_curation.configure(state="normal")
+        else:
+            self.resume_curation.deselect()
+            self.resume_curation.configure(state="disabled")
+
     def _check_provenance(self):
         if not hasattr(self, "do_mc"):
             return
@@ -370,6 +398,8 @@ class PipelineGUI(ctk.CTk):
             parts.append("CNMF ✓")
         else:
             self.do_cnmf.select()
+        # select()/deselect() do not fire the checkbox command
+        self._sync_resume_curation()
 
         results_dir = Path(project_dir) / "analysis"
         if (results_dir / "resp1.npy").exists():
@@ -432,7 +462,10 @@ class PipelineGUI(ctk.CTk):
                      text="These settings affect which pixels are identified as neurons before CNMF.",
                      text_color="gray").pack(anchor="w", padx=22, pady=(2, 6))
 
-        self.cp_diameter_var      = ctk.StringVar(value="15")
+        # KP (Huang et al. 2024) used 15 px at 1.458 µm/px (746.5 µm / 512 px),
+        # about 21.9 µm; at our 1.2109 µm/px that is 21.9 / 1.2109 ≈ 18 px.
+        # Flow and cell-probability thresholds are unitless, so KP's carry over.
+        self.cp_diameter_var      = ctk.StringVar(value="18")
         self.cp_diameter_auto_var = ctk.BooleanVar(value=False)
         self.cp_flow_var          = ctk.StringVar(value="2.0")
         self.cp_cellprob_var      = ctk.StringVar(value="-1.0")
@@ -592,7 +625,8 @@ class PipelineGUI(ctk.CTk):
 
         self.do_cnmf = ctk.CTkCheckBox(
             stages,
-            text="Source extraction / CNMF,  slow, opens interactive ROI editor, skip if already done")
+            text="Source extraction / CNMF,  slow, opens interactive ROI editor, skip if already done",
+            command=self._sync_resume_curation)
         self.do_cnmf.pack(anchor="w", padx=16, pady=4)
         self.do_cnmf.select()
 
@@ -601,6 +635,7 @@ class PipelineGUI(ctk.CTk):
             text="Resume previous ROI curation,  reopen the editor with the neurons you "
                  "added / removed last time instead of a fresh Cellpose detection")
         self.resume_curation.pack(anchor="w", padx=40, pady=(0, 4))
+        self._sync_resume_curation()
 
         self.do_subregion_setup = ctk.CTkCheckBox(
             stages,
@@ -1034,8 +1069,10 @@ class PipelineGUI(ctk.CTk):
 
         if record is not None:
             try:
+                from pipeline_utils import um_per_px_of
                 s = save_curation(output_dir, z, record,
-                                  previous=prev if reuse_ids else None)
+                                  previous=prev if reuse_ids else None,
+                                  um_per_px=um_per_px_of(getattr(self, '_provenance', None)))
                 ac = s["after_curation"]
                 self._log(
                     f"  {z} curation: detected {s['n_detected']}  →  final {s['n_final']}  "
@@ -1044,9 +1081,13 @@ class PipelineGUI(ctk.CTk):
                     f"{len(s['removed_region_ids'])})")
                 if s["ap_polygon"]:
                     d = ac["all"]["density"]
+                    dm = ac["all"].get("density_mm2") or {}
+                    def _dens(reg):
+                        px = f"{d[reg]} / 10k px²"
+                        return f"{px}, {dm[reg]:.0f} / mm²" if dm.get(reg) else px
                     self._log(
-                        f"    AP: {ac['all']['count']['AP']} neurons ({d['AP']} / 10k px²)   "
-                        f"NTS: {ac['all']['count']['NTS']} neurons ({d['NTS']} / 10k px²)")
+                        f"    AP: {ac['all']['count']['AP']} neurons ({_dens('AP')})   "
+                        f"NTS: {ac['all']['count']['NTS']} neurons ({_dens('NTS')})")
                 self._log(f"    Record + screenshots: {Path(output_dir) / 'roi_curation'}")
                 self._write_curation_summary(Path(output_dir).parent)
             except Exception:
@@ -1107,7 +1148,8 @@ class PipelineGUI(ctk.CTk):
                 cnm = _cnmf_module.load_CNMF(str(cnm_file))
             y = update_yield(plane_dir, z, cnm.estimates.A,
                              is_cell=_load_is_cell(cnm_file, z),
-                             responsive=responsive)
+                             responsive=responsive,
+                             qc_pass=_qc_pass_mask(cnm.estimates))
             if y is not None:
                 for line in format_yield(z, y):
                     self._log(line)
@@ -1123,7 +1165,24 @@ class PipelineGUI(ctk.CTk):
 
         self._log("  Building neuron list from CNMF estimates …")
         neurons = Neuron.build_all(cnm.estimates, dims=cnm.dims)   # pure numpy, safe on worker thread
+        n_fail = sum(1 for n in neurons if n.passed_qc is False)
+        if any(n.passed_qc is not None for n in neurons):
+            self._log(f"  CaImAn check: {len(neurons) - n_fail} passed, {n_fail} failed "
+                      f"(failed start rejected; review them in the viewer)")
+        else:
+            self._log("  CaImAn check: no pass/fail saved in this CNMF file, all start accepted")
         self._log(f"  Neuron viewer: {len(neurons)} components — opening …")
+
+        qc_thresholds = None
+        try:
+            qc_thresholds = {key: cnm.params.get('quality', key)
+                             for key in ('min_SNR', 'rval_thr', 'SNR_lowest', 'rval_lowest')}
+        except Exception:
+            pass
+
+        from pipeline_utils import um_per_px_of
+        um_per_px = um_per_px_of(provenance if provenance is not None
+                                 else getattr(self, '_provenance', None))
 
         # Build timing_info for trace annotations if we have session data
         timing_info = None
@@ -1159,6 +1218,8 @@ class PipelineGUI(ctk.CTk):
                 frame_period=getattr(self, '_current_fp', 0.033),
                 on_close=_on_close,
                 timing_info=timing_info,
+                qc_thresholds=qc_thresholds,
+                um_per_px=um_per_px,
             )
 
         self.after(0, _show)
@@ -1211,7 +1272,11 @@ class PipelineGUI(ctk.CTk):
             def _on_close(updated):
                 result_holder[0] = updated
                 done.set()
-            ZPlaneViewerWindow(self, plane_data, on_close=_on_close)
+            from pipeline_utils import scale_of
+            _sc = scale_of(provenance) or {}
+            ZPlaneViewerWindow(self, plane_data, on_close=_on_close,
+                               um_per_px=_sc.get('um_per_px'),
+                               z_step_um=_sc.get('z_step_um'))
 
         self.after(0, _show)
         done.wait()
@@ -1245,7 +1310,7 @@ class PipelineGUI(ctk.CTk):
     def _pipeline_body(self, p: dict):
         from pipeline import (init, load_data, affine_motion_correction,
                                rigid_motion_correction, source_extraction,
-                               _get_provenance, _save_provenance)
+                               ensure_scale, _get_provenance, _save_provenance)
         from pipeline_funcs import (get_stims_n, get_resp_n,
                                     get_region_labels, get_spatial_response_data)
 
@@ -1318,6 +1383,18 @@ class PipelineGUI(ctk.CTk):
 
             self._provenance = provenance
 
+            # pixel size from the session XMLs; backfilled for projects processed
+            # before it was recorded, so areas and densities can be given in µm
+            try:
+                sc = ensure_scale(provenance)
+                if sc:
+                    z_txt = f"{sc['z_step_um']:g} µm" if sc.get('z_step_um') else "unknown"
+                    self._log(f"  Scale: {sc['um_per_px']:.4f} µm/px,  z step {z_txt}")
+                else:
+                    self._log("  Scale: pixel size unknown, areas and distances stay in px")
+            except Exception as _e:
+                self._log(f"  Warning: could not read pixel size ({_e})")
+
             self._resumed_planes = {}              # z -> record the ROIs came from
             if self.do_cnmf.get():
                 roi_fn = self._roi_editor_for_pipeline
@@ -1341,7 +1418,8 @@ class PipelineGUI(ctk.CTk):
                         roi_editor_fn=roi_fn,
                         neuron_viewer_fn=_make_viewer_fn(z),
                         initial_rois_fn=resume_fn,
-                        idroi_params=cp)
+                        idroi_params=cp,
+                        runcnmf_params=dict(fr=1 / fp))
                     self._report_curation_yield(provenance, z)
             else:
                 self._log("  Skipping CNMF,  using saved results.")

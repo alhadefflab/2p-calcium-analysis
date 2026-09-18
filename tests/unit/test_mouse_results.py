@@ -203,5 +203,6 @@ def test_main_writes_outputs(tmp_path):
     pooled = pd.read_csv(out / "pooled_neurons.csv")
     assert len(pooled) == 7
     traces = pd.read_csv(out / "mean_traces_All.csv")
-    assert {"time_s", "stim1_A", "stim1_B", "stim1_mean", "stim1_sem"} <= set(traces.columns)
+    assert {"time_s", "stim1_mouse_A", "stim1_mouse_B",
+           "stim1_mean", "stim1_sem"} <= set(traces.columns)
     assert traces["time_s"].iloc[10] == 0.0

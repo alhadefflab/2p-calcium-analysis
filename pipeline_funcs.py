@@ -198,10 +198,38 @@ def show_subregions(img, cnm, area_indices, area_colors):
 
 
 def _load_is_cell(cnm_file, z):
-    """Return bool array (K,) from concat_{z}_is_cell.npy, or None if absent."""
+    """Return bool array (K,) of accepted components, or None (use all).
+
+    Uses concat_{z}_is_cell.npy (neuron viewer decisions) when present.  Without
+    it, falls back to CaImAn's saved quality-check verdict, so components that
+    failed are not silently analysed.  Returns None only when neither exists
+    (e.g. older runs, whose failures were already removed by select_components).
+    """
     from pathlib import Path as _P
     p = _P(cnm_file).parent / f'concat_{z}_is_cell.npy'
-    return np.load(p) if p.exists() else None
+    if p.exists():
+        return np.load(p)
+    return _qc_verdict_mask(cnm_file)
+
+
+def _qc_verdict_mask(cnm_file):
+    """(K,) bool from estimates/idx_components in a CNMF hdf5, or None if not saved."""
+    import h5py
+    try:
+        with h5py.File(cnm_file, 'r') as h:
+            est = h['estimates']
+            K = int(est['A']['shape'][()][1])
+            good, bad = est['idx_components'], est['idx_components_bad']
+            if good.shape == () or bad.shape == ():      # saved as None
+                return None
+            good, bad = good[()], bad[()]
+    except (OSError, KeyError):
+        return None
+    if good.size + bad.size != K:
+        return None
+    mask = np.zeros(K, dtype=bool)
+    mask[good.astype(int)] = True
+    return mask
 
 
 def custom_df_f(c, baseline, quantileMin = 50, use_residuals = False): #TODO move this to utils
